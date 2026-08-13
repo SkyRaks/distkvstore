@@ -135,6 +135,7 @@ type node struct {
 	role        role
 	currentTerm int
 	votedFor    string // candidateId this node voted for in currentTerm, "" if none yet
+	leaderID    string // who this node currently believes is leader, "" if unknown
 
 	// Election timeout is drawn fresh, uniformly, from
 	// [electionTimeoutMin, electionTimeoutMax) every time it's armed.
@@ -142,6 +143,11 @@ type node struct {
 	// forever -- see runElectionTimer.
 	electionTimeoutMin time.Duration
 	electionTimeoutMax time.Duration
+
+	// heartbeatInterval is how often a leader proves it's still alive. Must
+	// be comfortably shorter than electionTimeoutMin, or followers would
+	// time out and start elections even with a perfectly healthy leader.
+	heartbeatInterval time.Duration
 
 	// resetCh tells runElectionTimer to abandon its current countdown and
 	// draw a fresh one, without becoming a candidate. Sent to whenever this
@@ -160,6 +166,7 @@ type pingResponse struct {
 	Role     string `json:"role"`
 	Term     int    `json:"term"`
 	VotedFor string `json:"voted_for,omitempty"`
+	LeaderID string `json:"leader_id,omitempty"`
 }
 
 // requestVoteResponse is what GET/POST/PUT /request-vote returns: whether
@@ -169,6 +176,16 @@ type pingResponse struct {
 type requestVoteResponse struct {
 	Term        int  `json:"term"`
 	VoteGranted bool `json:"vote_granted"`
+}
+
+// appendEntriesResponse is what GET/POST/PUT /append-entries returns. Real
+// Raft's AppendEntries also carries log entries and a Success that reflects
+// log consistency; this project has no replicated log, so Success here just
+// means "your term checks out, you're a legitimate leader, my countdown is
+// reset."
+type appendEntriesResponse struct {
+	Term    int  `json:"term"`
+	Success bool `json:"success"`
 }
 
 // peerResult is one row of GET /ping-peer's report: what happened when this
@@ -190,10 +207,10 @@ func (n *node) handlePing(w http.ResponseWriter, r *http.Request) {
 	}
 
 	n.mu.RLock()
-	role, term, votedFor := n.role, n.currentTerm, n.votedFor
+	role, term, votedFor, leaderID := n.role, n.currentTerm, n.votedFor, n.leaderID
 	n.mu.RUnlock()
 
-	writeJSON(w, pingResponse{ID: n.id, Addr: n.addr, Role: role.String(), Term: term, VotedFor: votedFor})
+	writeJSON(w, pingResponse{ID: n.id, Addr: n.addr, Role: role.String(), Term: term, VotedFor: votedFor, LeaderID: leaderID})
 }
 
 // handlePingPeer is the outbound side: curling this makes *this* node turn
@@ -306,6 +323,75 @@ func (n *node) handleRequestVote(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, resp)
 }
 
+// handleAppendEntries is the follower side of a heartbeat: the leader calls
+// this on every peer, repeatedly, to prove it's still alive and to keep
+// followers from starting elections of their own. Real Raft's AppendEntries
+// also carries log entries for replication; this project has no replicated
+// log, so every call here is an empty heartbeat.
+func (n *node) handleAppendEntries(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet, http.MethodPut, http.MethodPost:
+	default:
+		w.Header().Set("Allow", "GET, PUT, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	q := r.URL.Query()
+	leaderID := q.Get("leaderId")
+	term, err := strconv.Atoi(q.Get("term"))
+	if leaderID == "" || err != nil {
+		http.Error(w, `missing or invalid "term"/"leaderId" query parameter`, http.StatusBadRequest)
+		return
+	}
+
+	n.mu.Lock()
+
+	if term < n.currentTerm {
+		// Stale leader; tell it our term so it knows to step down.
+		resp := appendEntriesResponse{Term: n.currentTerm, Success: false}
+		n.mu.Unlock()
+		writeJSON(w, resp)
+		return
+	}
+
+	prevTerm, prevLeader := n.currentTerm, n.leaderID
+
+	if term > n.currentTerm {
+		// A newer term exists. Adopt it and step down -- no matter what we
+		// currently think we are -- same rule as handleRequestVote.
+		n.currentTerm = term
+		n.role = follower
+		n.votedFor = ""
+	} else if n.role == candidate {
+		// Same term, but someone already won the election we're mid-running.
+		// Concede: without this, resetCh below would keep restarting our
+		// countdown forever while role stays stuck at "candidate", since
+		// nothing else would ever flip it back to follower.
+		n.role = follower
+	}
+	n.leaderID = leaderID
+
+	resp := appendEntriesResponse{Term: n.currentTerm, Success: true}
+	n.mu.Unlock()
+
+	// Only log on an actual change -- heartbeats repeat every heartbeatInterval
+	// forever, and logging every steady-state one would drown out everything
+	// else.
+	if term != prevTerm || leaderID != prevLeader {
+		log.Printf("[%s] recognized %s as leader for term %d", n.id, leaderID, term)
+	}
+
+	// Legitimate leader contact resets our countdown, same mechanism and
+	// channel used for vote grants.
+	select {
+	case n.resetCh <- struct{}{}:
+	default:
+	}
+
+	writeJSON(w, resp)
+}
+
 // randomElectionTimeout draws a duration uniformly from [min, max). A fresh
 // draw every time this is called is what keeps peers from timing out in
 // lockstep.
@@ -317,12 +403,16 @@ func randomElectionTimeout(min, max time.Duration) time.Duration {
 }
 
 // runElectionTimer is the clock that turns silence into a candidacy. Hearing
-// from, and granting a vote to, a legitimate candidate (handleRequestVote)
-// resets the countdown via resetCh instead of it firing.
+// from a legitimate candidate (handleRequestVote) or a legitimate leader
+// (handleAppendEntries) resets the countdown via resetCh instead of it
+// firing.
 //
-// Note this keeps running regardless of role: a node that wins an election
-// has nothing yet to stop its own timer, so it will eventually time out and
-// re-elect itself. Heartbeats are what fix that, and they don't exist yet.
+// This keeps running for the entire lifetime of the node, including while
+// it's leader -- but a leader ignores its own firing (see the role check
+// below) rather than challenging itself. Real Raft leaders simply don't run
+// an election timer at all; keeping one goroutine running for every role,
+// and just having it no-op when irrelevant, is a smaller change than
+// starting and stopping a whole goroutine on every role transition.
 //
 // ctx is the same shutdown context main() waits on for Ctrl+C, so the timer
 // goroutine exits cleanly alongside the HTTP server instead of leaking past
@@ -334,11 +424,18 @@ func (n *node) runElectionTimer(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-n.resetCh:
-			// Heard from, and voted for, a legitimate candidate -- start the
+			// Heard from a legitimate candidate or leader -- start the
 			// countdown over instead of also declaring candidacy right now.
 			continue
 		case <-time.After(d):
 			n.mu.Lock()
+			if n.role == leader {
+				// Already in charge; no reason to challenge ourselves. This
+				// is what stops the churn seen before heartbeats existed --
+				// a leader that just re-elects itself every timeout window.
+				n.mu.Unlock()
+				continue
+			}
 			n.currentTerm++
 			n.role = candidate
 			n.votedFor = n.id // a candidate always votes for itself
@@ -420,7 +517,10 @@ func (n *node) startElection(ctx context.Context, term int) {
 		return
 	}
 	n.role = leader
+	n.leaderID = n.id
 	log.Printf("[%s] won election for term %d with %d/%d votes -> leader", n.id, term, votes, needed)
+
+	go n.runHeartbeats(ctx, term)
 }
 
 // requestVoteFrom asks a single peer for its vote. A failed call is reported
@@ -450,6 +550,99 @@ func (n *node) requestVoteFrom(ctx context.Context, peer string, term int) reque
 	return body
 }
 
+// runHeartbeats is the leader-side counterpart to runElectionTimer: instead
+// of counting down to a candidacy, it repeatedly proves this node is still
+// leader, on an interval well under any follower's election timeout. It
+// exits the moment this node is no longer leader for this exact term --
+// either because a heartbeat response revealed a higher term
+// (broadcastHeartbeat handles stepping down) or because state moved on some
+// other way -- so at most one of these loops is ever actually sending.
+func (n *node) runHeartbeats(ctx context.Context, term int) {
+	n.broadcastHeartbeat(ctx, term) // announce the win now, don't wait for the first tick
+
+	ticker := time.NewTicker(n.heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n.mu.RLock()
+			stillLeader := n.role == leader && n.currentTerm == term
+			n.mu.RUnlock()
+			if !stillLeader {
+				return
+			}
+			n.broadcastHeartbeat(ctx, term)
+		}
+	}
+}
+
+// broadcastHeartbeat sends one round of heartbeats to every peer in
+// parallel and waits for the round to finish, same fan-out shape as
+// startElection. There's nothing to count here -- a leader doesn't need a
+// majority to keep being leader on any single round -- the only thing that
+// matters is whether any response reveals a higher term, meaning a newer
+// leader already exists somewhere and this node must step down.
+func (n *node) broadcastHeartbeat(ctx context.Context, term int) {
+	if len(n.peers) == 0 {
+		return
+	}
+
+	results := make(chan appendEntriesResponse, len(n.peers))
+	for _, peer := range n.peers {
+		go func(peer string) {
+			results <- n.appendEntriesFrom(ctx, peer, term)
+		}(peer)
+	}
+
+	for range n.peers {
+		select {
+		case <-ctx.Done():
+			return
+		case resp := <-results:
+			if resp.Term > term {
+				n.mu.Lock()
+				if resp.Term > n.currentTerm {
+					n.currentTerm = resp.Term
+					n.role = follower
+					n.votedFor = ""
+					log.Printf("[%s] saw higher term %d while leader (was term %d) -> follower", n.id, resp.Term, term)
+				}
+				n.mu.Unlock()
+			}
+		}
+	}
+}
+
+// appendEntriesFrom sends one heartbeat to a single peer. Same failure
+// handling as requestVoteFrom: an unreachable peer just misses this round's
+// proof of life, which is normal and not an application error.
+func (n *node) appendEntriesFrom(ctx context.Context, peer string, term int) appendEntriesResponse {
+	url := "http://" + peer + "/append-entries?term=" + strconv.Itoa(term) + "&leaderId=" + n.id
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		log.Printf("[%s] heartbeat to %s: %v", n.id, peer, err)
+		return appendEntriesResponse{}
+	}
+
+	resp, err := n.client.Do(req)
+	if err != nil {
+		log.Printf("[%s] heartbeat to %s: %v", n.id, peer, err)
+		return appendEntriesResponse{}
+	}
+	defer resp.Body.Close()
+
+	var body appendEntriesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		log.Printf("[%s] heartbeat response from %s: %v", n.id, peer, err)
+		return appendEntriesResponse{}
+	}
+	return body
+}
+
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(v); err != nil {
@@ -475,6 +668,7 @@ func main() {
 	slow := flag.Duration("slow", 0, "delay before answering /ping, e.g. 3s (simulates a hung node)")
 	electionTimeoutMin := flag.Duration("election-timeout-min", 3*time.Second, "minimum election timeout")
 	electionTimeoutMax := flag.Duration("election-timeout-max", 6*time.Second, "maximum election timeout")
+	heartbeatInterval := flag.Duration("heartbeat-interval", 1*time.Second, "how often the leader sends heartbeats")
 	flag.Parse()
 
 	if *id == "" {
@@ -490,6 +684,7 @@ func main() {
 		store:              newStore(),
 		electionTimeoutMin: *electionTimeoutMin,
 		electionTimeoutMax: *electionTimeoutMax,
+		heartbeatInterval:  *heartbeatInterval,
 		resetCh:            make(chan struct{}, 1),
 	}
 
@@ -499,6 +694,7 @@ func main() {
 	mux.HandleFunc("GET /ping", n.handlePing)
 	mux.HandleFunc("GET /ping-peer", n.handlePingPeer)
 	mux.HandleFunc("/request-vote", n.handleRequestVote)
+	mux.HandleFunc("/append-entries", n.handleAppendEntries)
 
 	srv := &http.Server{
 		Addr:              *addr,
