@@ -46,9 +46,8 @@ func (n *node) handleAppendEntries(w http.ResponseWriter, r *http.Request) {
 	if term > n.currentTerm {
 		// A newer term exists. Adopt it and step down -- no matter what we
 		// currently think we are -- same rule as handleRequestVote.
-		n.currentTerm = term
+		n.setTermAndVote(term, "")
 		n.role = follower
-		n.votedFor = ""
 	} else if n.role == candidate {
 		// Same term, but someone already won the election we're mid-running.
 		// Concede: without this, resetCh below would keep restarting our
@@ -133,9 +132,8 @@ func (n *node) broadcastHeartbeat(ctx context.Context, term int) {
 			if resp.Term > term {
 				n.mu.Lock()
 				if resp.Term > n.currentTerm {
-					n.currentTerm = resp.Term
+					n.setTermAndVote(resp.Term, "")
 					n.role = follower
-					n.votedFor = ""
 					log.Printf("[%s] saw higher term %d while leader (was term %d) -> follower", n.id, resp.Term, term)
 				}
 				n.mu.Unlock()

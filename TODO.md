@@ -52,36 +52,68 @@ provably identical, so this was demonstrated rather than assumed.
 export decisions and touches every identifier. Revisit if the code grows
 again after log replication.
 
-## 1. Connect `/put` to Raft (leader-only writes)
+## 1. Connect `/put` to Raft (leader-only writes) -- DONE
 
-**The problem.** `/get` and `/put` are registered as `*store` methods
-([main.go:62-63](main.go#L62-L63)), so `handlePut`
-([store.go:50](store.go#L50)) has no access to `role`, `currentTerm`, or
-`peers` -- it structurally *cannot* consult Raft. Every node accepts writes,
-each write lands only in that node's local map, and nothing replicates.
-Three running nodes are three silently diverging key-value stores. Reproduce:
-`curl "localhost:8080/put?key=a&value=1"` then
-`curl "localhost:8081/get?key=a"` -> 404.
+**The problem.** `/get` and `/put` were registered as `*store` methods, so
+`handlePut` had no access to `role`, `currentTerm`, or `peers` -- it
+structurally *could not* consult Raft. Every node accepted writes, each
+write landed only in that node's local map, and nothing replicated. Three
+running nodes were three silently diverging key-value stores.
 
-**Fix.** Move the KV handlers onto `*node` (keeping `store` itself as the
-storage type). Reject writes unless `role == leader`; otherwise return a
-redirect or a hint pointing at `leaderID`. This doesn't add replication --
-it makes the cluster honest about what it can currently guarantee, and
-forces the leader-redirect problem that log replication needs anyway.
+**Fix.** Moved `handleGet`/`handlePut` onto `*node`
+([store.go](store.go)), keeping `store` itself as the storage type
+(`n.store.get`/`n.store.put`). `handlePut` now rejects writes unless
+`n.role == leader`, returning `409 Conflict` with a JSON body
+`{"error":"not the leader","leader_id":"<id or empty>"}` -- empty when no
+leader is currently known (e.g. mid-election), telling the client to just
+retry shortly rather than pointing it anywhere.
 
-## 2. Persist `currentTerm` and `votedFor`
+This doesn't add replication -- a write still only lands on one node's map,
+it's just now the *correct* node -- but it makes the cluster honest about
+what it can currently guarantee, and forces the leader-redirect problem
+that log replication needs anyway.
+
+**Verified:** `gofmt`/`vet`/`build` clean. 3-node run: writes to the leader
+succeed and are readable; writes to either follower are rejected with
+`leader_id` pointing at the real leader; after killing the leader, the new
+leader accepts writes and the remaining follower's rejection correctly
+repoints at the new leader.
+
+## 2. Persist `currentTerm` and `votedFor` -- DONE
 
 **The problem.** Figure 2 of the Raft paper marks these as persistent state,
-written to stable storage *before* responding to any RPC. Ours are in-memory
-only ([raft.go:59-60](raft.go#L59-L60)). This is a genuine safety bug,
-not a nicety: a node that votes in term 5, crashes, and restarts comes back
-with no memory of voting, votes a second time in the same term, and lets two
-different candidates each collect a majority -> **two leaders in one term**,
-breaking Election Safety.
+written to stable storage *before* responding to any RPC. They were
+in-memory only. This was a genuine safety bug, not a nicety: a node that
+votes in term 5, crashes, and restarts comes back with no memory of voting,
+votes a second time in the same term, and lets two different candidates
+each collect a majority -> **two leaders in one term**, breaking Election
+Safety.
 
-**Fix.** Write both values to a file (JSON is fine) before responding in
-`handleRequestVote` ([election.go](election.go)) / `handleAppendEntries`
-([heartbeat.go](heartbeat.go)) and wherever the term changes. Load on startup.
+**Fix.** New [persist.go](persist.go): `n.setTermAndVote(term, votedFor)`
+mutates both fields and writes them to `<state-dir>/<id>.state.json` before
+returning, so "changed in memory" and "flushed to disk" never drift apart.
+All five call sites that used to assign `currentTerm`/`votedFor` directly
+(`handleRequestVote`, `handleAppendEntries`, `runElectionTimer`,
+`startElection`, `broadcastHeartbeat`) now go through it. `main.go` gained
+a `-state-dir` flag (default `.`) and calls `n.loadPersistedState()` at
+startup, before any goroutine runs. A state file that exists but won't
+parse is treated as a real problem, not a fresh start: `log.Fatal` rather
+than silently resetting to term 0, since silently resetting is exactly the
+bug this item closes.
+
+**Verified:** restart preserves term/vote (confirmed via the state file
+and `/ping`). The actual double-vote-after-crash scenario was reproduced
+and fixed: a node granted a vote in term 5, was killed and restarted, and
+then correctly *rejected* a second vote request for term 5 (would have
+been granted before this fix). Corrupt state file -> `log.Fatal`, exit
+code 1. 3-node election, leader-only writes, and failover all still work
+with three nodes sharing one `-state-dir`. `gofmt`/`vet`/`build` clean,
+`-race` clean under concurrent stress across all endpoints.
+
+*Left out of this increment:* the write in `savePersistedState` is a plain
+`os.WriteFile`, not write-to-temp-then-atomic-rename -- a crash mid-write
+could in principle leave a corrupt file. Noted in the code; revisit if it
+ever actually bites.
 
 ## 3. Log replication -- Raft's second pillar
 

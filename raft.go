@@ -50,6 +50,10 @@ type node struct {
 
 	store *store
 
+	// stateDir is where currentTerm/votedFor are persisted, as
+	// <stateDir>/<id>.state.json. See persist.go.
+	stateDir string
+
 	// Raft state. Guarded by its own mutex, separate from store.mu: election
 	// state and KV data are unrelated and shouldn't contend with each other.
 	// Zero values are correct starting state: every node begins a follower in

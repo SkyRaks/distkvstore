@@ -47,14 +47,13 @@ func (n *node) handleRequestVote(w http.ResponseWriter, r *http.Request) {
 	if term > n.currentTerm {
 		// A newer term exists somewhere. Adopt it and step down -- no matter
 		// what we currently think we are -- before deciding on the vote.
-		n.currentTerm = term
+		n.setTermAndVote(term, "")
 		n.role = follower
-		n.votedFor = ""
 	}
 
 	granted := n.votedFor == "" || n.votedFor == candidateID
 	if granted {
-		n.votedFor = candidateID
+		n.setTermAndVote(n.currentTerm, candidateID)
 	}
 	resp := requestVoteResponse{Term: n.currentTerm, VoteGranted: granted}
 	n.mu.Unlock()
@@ -116,9 +115,8 @@ func (n *node) runElectionTimer(ctx context.Context) {
 				n.mu.Unlock()
 				continue
 			}
-			n.currentTerm++
 			n.role = candidate
-			n.votedFor = n.id // a candidate always votes for itself
+			n.setTermAndVote(n.currentTerm+1, n.id) // a candidate always votes for itself
 			term := n.currentTerm
 			n.mu.Unlock()
 			log.Printf("[%s] election timeout after %s -> candidate, term=%d", n.id, d, term)
@@ -162,9 +160,8 @@ func (n *node) startElection(ctx context.Context, term int) {
 				// Someone is already ahead of us; this election is moot.
 				n.mu.Lock()
 				if res.Term > n.currentTerm {
-					n.currentTerm = res.Term
+					n.setTermAndVote(res.Term, "")
 					n.role = follower
-					n.votedFor = ""
 				}
 				n.mu.Unlock()
 				log.Printf("[%s] saw higher term %d during election for term %d -> follower", n.id, res.Term, term)
