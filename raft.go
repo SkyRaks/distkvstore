@@ -29,6 +29,16 @@ func (r role) String() string {
 	}
 }
 
+// logEntry is one client command in the replicated log. Term is the term of
+// the leader that created the entry -- it's what lets a follower detect that
+// its log diverged from the leader's at a given index, since two logs that
+// agree on (index, term) are guaranteed to be identical up to that point.
+type logEntry struct {
+	Term  int    `json:"term"`
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
 // node is one member of the cluster. It is both a server (it answers requests
 // from peers) and a client (it makes requests to them).
 type node struct {
@@ -63,6 +73,12 @@ type node struct {
 	currentTerm int
 	votedFor    string // candidateId this node voted for in currentTerm, "" if none yet
 	leaderID    string // who this node currently believes is leader, "" if unknown
+
+	// log is the replicated log. It is 1-indexed to match the paper: log[0]
+	// is a permanent sentinel that is never replicated and never applied, so
+	// a Go slice index equals a Raft log index and "index 0" naturally means
+	// "before the first entry." In-memory only for now -- see TODO.md.
+	log []logEntry
 
 	// Election timeout is drawn fresh, uniformly, from
 	// [electionTimeoutMin, electionTimeoutMax) every time it's armed.

@@ -1,0 +1,63 @@
+package main
+
+import "testing"
+
+// testNode builds a node suitable for unit tests: a real temp dir so
+// setTermAndVote can persist, a real store, a sentinel-only log, and a
+// buffered resetCh so non-blocking sends never block.
+func testNode(t *testing.T, id string) *node {
+	t.Helper()
+	return &node{
+		id:       id,
+		stateDir: t.TempDir(),
+		store:    newStore(),
+		log:      []logEntry{{}},
+		resetCh:  make(chan struct{}, 1),
+	}
+}
+
+func TestEmptyLogHasSentinelOnly(t *testing.T) {
+	n := testNode(t, "n1")
+
+	if got := n.lastLogIndex(); got != 0 {
+		t.Fatalf("lastLogIndex() = %d, want 0 for an empty log", got)
+	}
+	if got := n.lastLogTerm(); got != 0 {
+		t.Fatalf("lastLogTerm() = %d, want 0 for an empty log", got)
+	}
+}
+
+func TestLastLogIndexAndTerm(t *testing.T) {
+	n := testNode(t, "n1")
+	n.log = append(n.log, logEntry{Term: 1, Key: "a", Value: "1"})
+	n.log = append(n.log, logEntry{Term: 3, Key: "b", Value: "2"})
+
+	if got := n.lastLogIndex(); got != 2 {
+		t.Fatalf("lastLogIndex() = %d, want 2", got)
+	}
+	if got := n.lastLogTerm(); got != 3 {
+		t.Fatalf("lastLogTerm() = %d, want 3", got)
+	}
+}
+
+func TestTermAt(t *testing.T) {
+	n := testNode(t, "n1")
+	n.log = append(n.log, logEntry{Term: 1})
+	n.log = append(n.log, logEntry{Term: 4})
+
+	tests := []struct {
+		index int
+		want  int
+	}{
+		{0, 0}, // sentinel
+		{1, 1},
+		{2, 4},
+		{3, -1}, // past the end
+		{-1, -1},
+	}
+	for _, tc := range tests {
+		if got := n.termAt(tc.index); got != tc.want {
+			t.Errorf("termAt(%d) = %d, want %d", tc.index, got, tc.want)
+		}
+	}
+}

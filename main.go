@@ -58,6 +58,7 @@ func main() {
 		client:             &http.Client{Timeout: 1 * time.Second},
 		store:              newStore(),
 		stateDir:           *stateDir,
+		log:                []logEntry{{}}, // index 0 is the sentinel
 		electionTimeoutMin: *electionTimeoutMin,
 		electionTimeoutMax: *electionTimeoutMax,
 		heartbeatInterval:  *heartbeatInterval,
