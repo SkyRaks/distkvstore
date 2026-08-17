@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"net/http"
 	"sync"
 )
@@ -75,25 +76,35 @@ func (n *node) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	n.mu.RLock()
-	role, leaderID := n.role, n.leaderID
-	n.mu.RUnlock()
-
-	if role != leader {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		writeJSON(w, notLeaderResponse{Error: "not the leader", LeaderID: leaderID})
-		return
-	}
-
 	q := r.URL.Query()
 	key := q.Get("key")
 	if key == "" {
 		http.Error(w, `missing "key" query parameter`, http.StatusBadRequest)
 		return
 	}
+
+	n.mu.Lock()
+	if n.role != leader {
+		leaderID := n.leaderID
+		n.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		writeJSON(w, notLeaderResponse{Error: "not the leader", LeaderID: leaderID})
+		return
+	}
 	// An absent value stores the empty string; that's a legitimate value.
+	index := n.appendCommand(key, q.Get("value"))
+	term := n.currentTerm
+	n.mu.Unlock()
+
+	// The entry is in the leader's log but has not been replicated to anyone,
+	// so it is NOT yet safe. Applying and answering OK here is a deliberate
+	// placeholder that keeps /get working while replication is built; Task 4
+	// moves the apply behind commitIndex and Task 6 makes this wait for a
+	// majority before answering.
 	n.store.put(key, q.Get("value"))
+
+	log.Printf("[%s] appended %s=%s at index %d (term %d)", n.id, key, q.Get("value"), index, term)
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write([]byte("OK\n"))

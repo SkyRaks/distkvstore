@@ -22,6 +22,17 @@ func (n *node) lastLogTerm() int {
 	return n.log[len(n.log)-1].Term
 }
 
+// appendCommand adds one client command to the log at the leader's current
+// term and returns the index it landed at. Only a leader calls this: entries
+// enter the log exactly one way, from the leader, which is what makes the
+// log a single authoritative ordering rather than a merge problem.
+//
+// Caller holds n.mu.
+func (n *node) appendCommand(key, value string) int {
+	n.log = append(n.log, logEntry{Term: n.currentTerm, Key: key, Value: value})
+	return n.lastLogIndex()
+}
+
 // termAt returns the term of the entry at index, or -1 if the index is out
 // of range. -1 rather than 0 on purpose: 0 is a legitimate term (the
 // sentinel's), so a caller comparing terms must be able to tell "no entry

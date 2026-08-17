@@ -40,6 +40,26 @@ func TestLastLogIndexAndTerm(t *testing.T) {
 	}
 }
 
+func TestAppendCommandReturnsIndexAndStampsTerm(t *testing.T) {
+	n := testNode(t, "n1")
+	n.currentTerm = 3
+
+	idx := n.appendCommand("a", "1")
+	if idx != 1 {
+		t.Fatalf("appendCommand returned %d, want 1 for the first real entry", idx)
+	}
+	if got := n.log[1].Term; got != 3 {
+		t.Fatalf("log[1].Term = %d, want 3 (the leader's current term)", got)
+	}
+	if n.log[1].Key != "a" || n.log[1].Value != "1" {
+		t.Fatalf("log[1] = %+v, want key=a value=1", n.log[1])
+	}
+
+	if idx2 := n.appendCommand("b", "2"); idx2 != 2 {
+		t.Fatalf("second appendCommand returned %d, want 2", idx2)
+	}
+}
+
 func TestTermAt(t *testing.T) {
 	n := testNode(t, "n1")
 	n.log = append(n.log, logEntry{Term: 1})
