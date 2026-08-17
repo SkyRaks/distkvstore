@@ -59,6 +59,8 @@ func main() {
 		store:              newStore(),
 		stateDir:           *stateDir,
 		log:                []logEntry{{}}, // index 0 is the sentinel
+		nextIndex:          make(map[string]int),
+		matchIndex:         make(map[string]int),
 		electionTimeoutMin: *electionTimeoutMin,
 		electionTimeoutMax: *electionTimeoutMax,
 		heartbeatInterval:  *heartbeatInterval,

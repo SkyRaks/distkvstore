@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -94,6 +95,81 @@ func (n *node) handleAppendEntries(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, resp)
 }
 
+// buildAppendEntries assembles the RPC for one peer from that peer's
+// nextIndex: everything from nextIndex onward, with the entry just before it
+// as the consistency check.
+//
+// Caller holds n.mu (read lock suffices).
+func (n *node) buildAppendEntries(peer string, term int) appendEntriesRequest {
+	next := n.nextIndex[peer]
+	if next < 1 {
+		next = 1
+	}
+	prevIndex := next - 1
+
+	// Copy rather than slice-alias the log: the caller releases n.mu before
+	// the network call, and a later append could reallocate or overwrite the
+	// backing array out from under an in-flight request.
+	var entries []logEntry
+	if next <= n.lastLogIndex() {
+		entries = make([]logEntry, n.lastLogIndex()-next+1)
+		copy(entries, n.log[next:])
+	}
+
+	return appendEntriesRequest{
+		Term:         term,
+		LeaderID:     n.id,
+		PrevLogIndex: prevIndex,
+		PrevLogTerm:  n.termAt(prevIndex),
+		Entries:      entries,
+		LeaderCommit: 0, // commitIndex arrives in Task 5
+	}
+}
+
+// handleAppendResult folds one peer's reply back into leader state.
+//
+// The two failure modes look identical on the wire and must not be confused:
+// a higher term means this node is no longer leader and must step down, while
+// an equal term with Success false means only that the logs don't line up
+// yet -- back nextIndex up one and try again on the next round. Treating the
+// second as the first would make a leader resign over a routine repair.
+//
+// Caller must NOT hold n.mu.
+func (n *node) handleAppendResult(peer string, req appendEntriesRequest, resp appendEntriesResponse) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if resp.Term > n.currentTerm {
+		n.setTermAndVote(resp.Term, "")
+		n.role = follower
+		n.leaderID = ""
+		log.Printf("[%s] saw higher term %d in an AppendEntries reply from %s -> follower", n.id, resp.Term, peer)
+		return
+	}
+
+	// A reply from an older round of our own leadership tells us nothing.
+	if n.role != leader || req.Term != n.currentTerm {
+		return
+	}
+
+	if resp.Success {
+		match := req.PrevLogIndex + len(req.Entries)
+		if match > n.matchIndex[peer] {
+			n.matchIndex[peer] = match
+		}
+		n.nextIndex[peer] = n.matchIndex[peer] + 1
+		return
+	}
+
+	// Log mismatch: back up one and retry on the next round. Real Raft can
+	// skip a whole conflicting term at once; one-at-a-time is slower but
+	// obviously correct, and this cluster's logs are tiny.
+	if n.nextIndex[peer] > 1 {
+		n.nextIndex[peer]--
+	}
+	log.Printf("[%s] %s rejected entries; backing nextIndex to %d", n.id, peer, n.nextIndex[peer])
+}
+
 // runHeartbeats is the leader-side counterpart to runElectionTimer: instead
 // of counting down to a candidacy, it repeatedly proves this node is still
 // leader, on an interval well under any follower's election timeout. It
@@ -123,49 +199,37 @@ func (n *node) runHeartbeats(ctx context.Context, term int) {
 	}
 }
 
-// broadcastHeartbeat sends one round of heartbeats to every peer in
+// broadcastHeartbeat sends one round of AppendEntries to every peer in
 // parallel and waits for the round to finish, same fan-out shape as
-// startElection. There's nothing to count here -- a leader doesn't need a
-// majority to keep being leader on any single round -- the only thing that
-// matters is whether any response reveals a higher term, meaning a newer
-// leader already exists somewhere and this node must step down.
+// startElection. Each peer's request is built from its own nextIndex, so
+// what one peer receives has nothing to do with what another receives.
+//
+// There is no counting here: each reply is folded back into leader state by
+// handleAppendResult in its own goroutine, which is also where a higher term
+// triggers stepping down.
 func (n *node) broadcastHeartbeat(ctx context.Context, term int) {
 	if len(n.peers) == 0 {
 		return
 	}
 
-	results := make(chan appendEntriesResponse, len(n.peers))
+	var wg sync.WaitGroup
 	for _, peer := range n.peers {
+		wg.Add(1)
 		go func(peer string) {
+			defer wg.Done()
+
 			n.mu.RLock()
-			req := appendEntriesRequest{
-				Term:         term,
-				LeaderID:     n.id,
-				PrevLogIndex: n.lastLogIndex(),
-				PrevLogTerm:  n.lastLogTerm(),
-				LeaderCommit: 0, // commitIndex arrives in Task 5
-			}
+			req := n.buildAppendEntries(peer, term)
 			n.mu.RUnlock()
-			results <- n.appendEntriesFrom(ctx, peer, req)
+
+			resp := n.appendEntriesFrom(ctx, peer, req)
+			if resp.Term == 0 && !resp.Success {
+				return // unreachable peer; nothing to fold in
+			}
+			n.handleAppendResult(peer, req, resp)
 		}(peer)
 	}
-
-	for range n.peers {
-		select {
-		case <-ctx.Done():
-			return
-		case resp := <-results:
-			if resp.Term > term {
-				n.mu.Lock()
-				if resp.Term > n.currentTerm {
-					n.setTermAndVote(resp.Term, "")
-					n.role = follower
-					log.Printf("[%s] saw higher term %d while leader (was term %d) -> follower", n.id, resp.Term, term)
-				}
-				n.mu.Unlock()
-			}
-		}
-	}
+	wg.Wait()
 }
 
 // appendEntriesFrom sends one AppendEntries to a single peer. Same failure

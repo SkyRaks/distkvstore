@@ -80,6 +80,17 @@ type node struct {
 	// "before the first entry." In-memory only for now -- see TODO.md.
 	log []logEntry
 
+	// Leader-only bookkeeping, one entry per peer. Reinitialized every time
+	// this node wins an election, because a new leader knows nothing about
+	// how far behind anyone is and must rediscover it.
+	//
+	// nextIndex is the leader's *guess* at the next index to send a peer --
+	// optimistically lastLogIndex+1, walked backwards on rejection until the
+	// logs line up. matchIndex is what the leader *knows* is replicated
+	// there, and only it is safe to count toward a majority.
+	nextIndex  map[string]int
+	matchIndex map[string]int
+
 	// Election timeout is drawn fresh, uniformly, from
 	// [electionTimeoutMin, electionTimeoutMax) every time it's armed.
 	// Randomized so peers don't all time out in lockstep and split every vote

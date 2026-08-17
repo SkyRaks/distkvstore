@@ -195,6 +195,16 @@ func (n *node) startElection(ctx context.Context, term int) {
 	}
 	n.role = leader
 	n.leaderID = n.id
+
+	// A new leader knows nothing about how far behind its peers are, so it
+	// guesses they match it exactly and lets rejections walk that back.
+	n.nextIndex = make(map[string]int, len(n.peers))
+	n.matchIndex = make(map[string]int, len(n.peers))
+	for _, peer := range n.peers {
+		n.nextIndex[peer] = n.lastLogIndex() + 1 // optimistic: assume they match us
+		n.matchIndex[peer] = 0                   // pessimistic: we know nothing yet
+	}
+
 	log.Printf("[%s] won election for term %d with %d/%d votes -> leader", n.id, term, votes, needed)
 
 	go n.runHeartbeats(ctx, term)
