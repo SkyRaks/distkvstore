@@ -91,6 +91,13 @@ type node struct {
 	nextIndex  map[string]int
 	matchIndex map[string]int
 
+	// commitIndex is the highest index known to be replicated on a majority
+	// and therefore safe to apply -- the line between "the leader has this"
+	// and "this write can never be lost." lastApplied is how far the store
+	// has actually consumed. Both start at 0 and only move forward.
+	commitIndex int
+	lastApplied int
+
 	// Election timeout is drawn fresh, uniformly, from
 	// [electionTimeoutMin, electionTimeoutMax) every time it's armed.
 	// Randomized so peers don't all time out in lockstep and split every vote

@@ -1,5 +1,7 @@
 package main
 
+import "sort"
+
 // This file holds the pure log helpers shared by both Raft RPCs:
 // AppendEntries uses them to decide whether a follower's log lines up with
 // the leader's, and RequestVote uses them to decide whether a candidate is
@@ -20,6 +22,70 @@ func (n *node) lastLogIndex() int {
 // lastLogTerm is the term of the newest entry, or 0 for an empty log.
 func (n *node) lastLogTerm() int {
 	return n.log[len(n.log)-1].Term
+}
+
+// majorityMatchIndex is the highest log index that a majority of the cluster
+// (this leader plus its peers) is known to hold.
+//
+// Sort every node's match position descending and take the element at the
+// majority boundary: with 3 nodes, needing 2, that's the 2nd highest.
+// Whatever index sits there is held by at least that many nodes.
+//
+// Caller holds n.mu.
+func (n *node) majorityMatchIndex() int {
+	matches := make([]int, 0, len(n.peers)+1)
+	matches = append(matches, n.lastLogIndex()) // the leader holds its own log
+	for _, peer := range n.peers {
+		matches = append(matches, n.matchIndex[peer])
+	}
+
+	sort.Sort(sort.Reverse(sort.IntSlice(matches)))
+
+	needed := len(matches)/2 + 1
+	return matches[needed-1]
+}
+
+// advanceCommitIndex moves commitIndex forward if a majority has caught up,
+// then applies whatever that newly makes safe.
+//
+// The currentTerm guard is Figure 8 of the paper, and it is subtle: a leader
+// may NOT commit an entry from an earlier term just because it now sits on a
+// majority of logs. Such an entry can still be overwritten by a future
+// leader, so acknowledging it would mean losing a write we already promised.
+// An entry from the leader's own term, once on a majority, is safe -- and
+// committing it commits everything before it by extension.
+//
+// Caller holds n.mu (write).
+func (n *node) advanceCommitIndex() {
+	if n.role != leader {
+		return
+	}
+
+	candidate := n.majorityMatchIndex()
+	if candidate <= n.commitIndex {
+		return
+	}
+	if n.termAt(candidate) != n.currentTerm {
+		return
+	}
+
+	n.commitIndex = candidate
+	n.applyCommitted()
+}
+
+// applyCommitted hands every entry between lastApplied and commitIndex to
+// the KV map, in order. This is the only place the map is written on the
+// replication path, which is what makes every node's map a replay of the
+// same ordered log.
+//
+// Caller holds n.mu (write); this takes store.mu internally. Lock ordering
+// is n.mu then store.mu, never the reverse.
+func (n *node) applyCommitted() {
+	for n.lastApplied < n.commitIndex {
+		n.lastApplied++
+		entry := n.log[n.lastApplied]
+		n.store.put(entry.Key, entry.Value)
+	}
 }
 
 // truncateAndAppend splices entries into the log starting right after

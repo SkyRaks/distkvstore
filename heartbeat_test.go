@@ -105,6 +105,44 @@ func TestAppendEntriesRejectsPrevLogTermMismatch(t *testing.T) {
 	}
 }
 
+func TestAppendEntriesAdoptsLeaderCommitAndApplies(t *testing.T) {
+	n := testNode(t, "n1")
+
+	resp := postAppendEntries(t, n, appendEntriesRequest{
+		Term: 1, LeaderID: "n2",
+		PrevLogIndex: 0, PrevLogTerm: 0,
+		Entries:      []logEntry{{Term: 1, Key: "a", Value: "1"}},
+		LeaderCommit: 1,
+	})
+
+	if !resp.Success {
+		t.Fatal("Success = false, want true")
+	}
+	if n.commitIndex != 1 {
+		t.Fatalf("commitIndex = %d, want 1", n.commitIndex)
+	}
+	if v, ok := n.store.get("a"); !ok || v != "1" {
+		t.Fatalf("store[a] = %q,%v -- a committed entry should be applied", v, ok)
+	}
+}
+
+// A follower must never trust leaderCommit past the end of its own log:
+// the leader may have committed entries this follower hasn't received.
+func TestAppendEntriesClampsLeaderCommitToOwnLog(t *testing.T) {
+	n := testNode(t, "n1")
+
+	postAppendEntries(t, n, appendEntriesRequest{
+		Term: 1, LeaderID: "n2",
+		PrevLogIndex: 0, PrevLogTerm: 0,
+		Entries:      []logEntry{{Term: 1, Key: "a", Value: "1"}},
+		LeaderCommit: 99,
+	})
+
+	if n.commitIndex != 1 {
+		t.Fatalf("commitIndex = %d, want 1 -- clamped to this node's last index", n.commitIndex)
+	}
+}
+
 func TestBuildAppendEntriesSendsSuffixFromNextIndex(t *testing.T) {
 	n := testNode(t, "leader")
 	n.currentTerm = 2

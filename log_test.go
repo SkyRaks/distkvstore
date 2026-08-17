@@ -40,6 +40,106 @@ func TestLastLogIndexAndTerm(t *testing.T) {
 	}
 }
 
+func TestMajorityMatchIndexThreeNodes(t *testing.T) {
+	n := testNode(t, "leader")
+	n.peers = []string{"p1", "p2"}
+	n.currentTerm = 1
+	n.log = append(n.log, logEntry{Term: 1}, logEntry{Term: 1})
+
+	// Leader has index 2 by definition; p1 has 2; p2 has nothing.
+	// Majority of 3 is 2 nodes -> index 2 is replicated on a majority.
+	n.matchIndex = map[string]int{"p1": 2, "p2": 0}
+
+	if got := n.majorityMatchIndex(); got != 2 {
+		t.Fatalf("majorityMatchIndex() = %d, want 2", got)
+	}
+}
+
+func TestMajorityMatchIndexWhenOnlyLeaderHasIt(t *testing.T) {
+	n := testNode(t, "leader")
+	n.peers = []string{"p1", "p2"}
+	n.currentTerm = 1
+	n.log = append(n.log, logEntry{Term: 1})
+	n.matchIndex = map[string]int{"p1": 0, "p2": 0}
+
+	if got := n.majorityMatchIndex(); got != 0 {
+		t.Fatalf("majorityMatchIndex() = %d, want 0 -- one node alone is not a majority", got)
+	}
+}
+
+// Figure 8 of the paper: a leader may only commit an entry from its OWN
+// term by counting replicas. Committing an older-term entry that way can be
+// undone by a later leader, silently losing an acknowledged write.
+func TestAdvanceCommitIndexRefusesEntriesFromOlderTerms(t *testing.T) {
+	n := testNode(t, "leader")
+	n.peers = []string{"p1", "p2"}
+	n.role = leader
+	n.currentTerm = 3
+	n.log = append(n.log, logEntry{Term: 1, Key: "old", Value: "x"})
+	n.matchIndex = map[string]int{"p1": 1, "p2": 1} // replicated everywhere
+
+	n.advanceCommitIndex()
+
+	if n.commitIndex != 0 {
+		t.Fatalf("commitIndex = %d, want 0 -- entry is from term 1, leader is in term 3", n.commitIndex)
+	}
+}
+
+func TestAdvanceCommitIndexCommitsCurrentTermEntry(t *testing.T) {
+	n := testNode(t, "leader")
+	n.peers = []string{"p1", "p2"}
+	n.role = leader
+	n.currentTerm = 3
+	n.log = append(n.log, logEntry{Term: 1, Key: "old", Value: "x"})
+	n.log = append(n.log, logEntry{Term: 3, Key: "new", Value: "y"})
+	n.matchIndex = map[string]int{"p1": 2, "p2": 0}
+
+	n.advanceCommitIndex()
+
+	if n.commitIndex != 2 {
+		t.Fatalf("commitIndex = %d, want 2", n.commitIndex)
+	}
+}
+
+func TestApplyCommittedWritesToStoreExactlyOnce(t *testing.T) {
+	n := testNode(t, "n1")
+	n.log = append(n.log, logEntry{Term: 1, Key: "a", Value: "1"})
+	n.log = append(n.log, logEntry{Term: 1, Key: "b", Value: "2"})
+	n.commitIndex = 2
+
+	n.applyCommitted()
+
+	if v, ok := n.store.get("a"); !ok || v != "1" {
+		t.Fatalf("store[a] = %q,%v; want \"1\",true", v, ok)
+	}
+	if v, ok := n.store.get("b"); !ok || v != "2" {
+		t.Fatalf("store[b] = %q,%v; want \"2\",true", v, ok)
+	}
+	if n.lastApplied != 2 {
+		t.Fatalf("lastApplied = %d, want 2", n.lastApplied)
+	}
+
+	// A second call must be a no-op, not a replay.
+	n.store.put("a", "clobbered")
+	n.applyCommitted()
+	if v, _ := n.store.get("a"); v != "clobbered" {
+		t.Fatal("applyCommitted replayed an already-applied entry")
+	}
+}
+
+func TestApplyCommittedStopsAtCommitIndex(t *testing.T) {
+	n := testNode(t, "n1")
+	n.log = append(n.log, logEntry{Term: 1, Key: "a", Value: "1"})
+	n.log = append(n.log, logEntry{Term: 1, Key: "b", Value: "2"})
+	n.commitIndex = 1 // only the first entry is committed
+
+	n.applyCommitted()
+
+	if _, ok := n.store.get("b"); ok {
+		t.Fatal("applied an uncommitted entry -- it could still be rolled back")
+	}
+}
+
 func TestTruncateAndAppendOnEmptyLog(t *testing.T) {
 	n := testNode(t, "n1")
 

@@ -97,13 +97,9 @@ func (n *node) handlePut(w http.ResponseWriter, r *http.Request) {
 	term := n.currentTerm
 	n.mu.Unlock()
 
-	// The entry is in the leader's log but has not been replicated to anyone,
-	// so it is NOT yet safe. Applying and answering OK here is a deliberate
-	// placeholder that keeps /get working while replication is built; Task 4
-	// moves the apply behind commitIndex and Task 6 makes this wait for a
-	// majority before answering.
-	n.store.put(key, q.Get("value"))
-
+	// The entry reaches the map only via applyCommitted, once a majority
+	// holds it. Answering OK here is still premature -- Task 6 makes this
+	// wait for the commit before replying.
 	log.Printf("[%s] appended %s=%s at index %d (term %d)", n.id, key, q.Get("value"), index, term)
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")

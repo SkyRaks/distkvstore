@@ -68,6 +68,13 @@ func (n *node) handleAppendEntries(w http.ResponseWriter, r *http.Request) {
 	ok := n.termAt(req.PrevLogIndex) == req.PrevLogTerm
 	if ok {
 		n.truncateAndAppend(req.PrevLogIndex, req.Entries)
+
+		// Adopt the leader's commit point, clamped to what we actually hold:
+		// the leader may have committed entries that haven't reached us yet.
+		if req.LeaderCommit > n.commitIndex {
+			n.commitIndex = min(req.LeaderCommit, n.lastLogIndex())
+			n.applyCommitted()
+		}
 	}
 
 	resp := appendEntriesResponse{Term: n.currentTerm, Success: ok}
@@ -122,7 +129,7 @@ func (n *node) buildAppendEntries(peer string, term int) appendEntriesRequest {
 		PrevLogIndex: prevIndex,
 		PrevLogTerm:  n.termAt(prevIndex),
 		Entries:      entries,
-		LeaderCommit: 0, // commitIndex arrives in Task 5
+		LeaderCommit: n.commitIndex,
 	}
 }
 
@@ -158,6 +165,7 @@ func (n *node) handleAppendResult(peer string, req appendEntriesRequest, resp ap
 			n.matchIndex[peer] = match
 		}
 		n.nextIndex[peer] = n.matchIndex[peer] + 1
+		n.advanceCommitIndex()
 		return
 	}
 
