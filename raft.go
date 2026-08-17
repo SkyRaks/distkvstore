@@ -121,11 +121,27 @@ type requestVoteResponse struct {
 	VoteGranted bool `json:"vote_granted"`
 }
 
-// appendEntriesResponse is what GET/POST/PUT /append-entries returns. Real
-// Raft's AppendEntries also carries log entries and a Success that reflects
-// log consistency; this project has no replicated log, so Success here just
-// means "your term checks out, you're a legitimate leader, my countdown is
-// reset."
+// appendEntriesRequest is the body of POST /append-entries. This replaced
+// the old query-string form once entries had to travel with the call: a
+// heartbeat is simply this with Entries empty, which is exactly how the
+// paper models it.
+//
+// PrevLogIndex/PrevLogTerm are the consistency check. They describe the
+// entry immediately before Entries[0]. A follower accepts only if its own
+// log has that exact (index, term) -- which, by induction, proves the two
+// logs are identical everywhere up to that point.
+type appendEntriesRequest struct {
+	Term         int        `json:"term"`
+	LeaderID     string     `json:"leader_id"`
+	PrevLogIndex int        `json:"prev_log_index"`
+	PrevLogTerm  int        `json:"prev_log_term"`
+	Entries      []logEntry `json:"entries"`
+	LeaderCommit int        `json:"leader_commit"`
+}
+
+// appendEntriesResponse is what POST /append-entries returns. Success means
+// the consistency check passed and the entries (if any) were stored -- not
+// merely that the term checked out.
 type appendEntriesResponse struct {
 	Term    int  `json:"term"`
 	Success bool `json:"success"`

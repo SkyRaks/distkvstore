@@ -22,6 +22,31 @@ func (n *node) lastLogTerm() int {
 	return n.log[len(n.log)-1].Term
 }
 
+// truncateAndAppend splices entries into the log starting right after
+// prevLogIndex. Caller has already verified the log matches at prevLogIndex.
+//
+// It walks entry by entry rather than blindly truncating, because
+// AppendEntries can legitimately be delivered twice (a retry, or a slow
+// duplicate). Blind truncation would chop off entries the leader already
+// considers committed. Only a genuine term conflict at an index causes a
+// truncation; matching entries are skipped over.
+//
+// Caller holds n.mu.
+func (n *node) truncateAndAppend(prevLogIndex int, entries []logEntry) {
+	for i, entry := range entries {
+		index := prevLogIndex + 1 + i
+
+		if index < len(n.log) {
+			if n.log[index].Term == entry.Term {
+				continue // already have this exact entry
+			}
+			// Conflict: this index and everything after it is wrong.
+			n.log = n.log[:index]
+		}
+		n.log = append(n.log, entry)
+	}
+}
+
 // appendCommand adds one client command to the log at the leader's current
 // term and returns the index it landed at. Only a leader calls this: entries
 // enter the log exactly one way, from the leader, which is what makes the

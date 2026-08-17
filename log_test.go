@@ -40,6 +40,51 @@ func TestLastLogIndexAndTerm(t *testing.T) {
 	}
 }
 
+func TestTruncateAndAppendOnEmptyLog(t *testing.T) {
+	n := testNode(t, "n1")
+
+	n.truncateAndAppend(0, []logEntry{{Term: 1, Key: "a", Value: "1"}})
+
+	if got := n.lastLogIndex(); got != 1 {
+		t.Fatalf("lastLogIndex = %d, want 1", got)
+	}
+	if n.log[1].Key != "a" {
+		t.Fatalf("log[1].Key = %q, want %q", n.log[1].Key, "a")
+	}
+}
+
+func TestTruncateAndAppendDropsConflictingSuffix(t *testing.T) {
+	n := testNode(t, "n1")
+	// Follower has two entries from an old term that the leader never had.
+	n.log = append(n.log, logEntry{Term: 1, Key: "a", Value: "old"})
+	n.log = append(n.log, logEntry{Term: 1, Key: "b", Value: "stale"})
+
+	// Leader says: after index 1, the entry is term 2 key=b value=new.
+	n.truncateAndAppend(1, []logEntry{{Term: 2, Key: "b", Value: "new"}})
+
+	if got := n.lastLogIndex(); got != 2 {
+		t.Fatalf("lastLogIndex = %d, want 2", got)
+	}
+	if n.log[2].Term != 2 || n.log[2].Value != "new" {
+		t.Fatalf("log[2] = %+v, want {Term:2 Key:b Value:new}", n.log[2])
+	}
+	if n.log[1].Value != "old" {
+		t.Fatalf("log[1] = %+v, want the matching prefix left intact", n.log[1])
+	}
+}
+
+func TestTruncateAndAppendIsIdempotentOnRepeatedEntries(t *testing.T) {
+	n := testNode(t, "n1")
+	entries := []logEntry{{Term: 1, Key: "a", Value: "1"}, {Term: 1, Key: "b", Value: "2"}}
+
+	n.truncateAndAppend(0, entries)
+	n.truncateAndAppend(0, entries) // a retried/duplicated RPC
+
+	if got := n.lastLogIndex(); got != 2 {
+		t.Fatalf("lastLogIndex = %d, want 2 -- a duplicate AppendEntries must not grow the log", got)
+	}
+}
+
 func TestAppendCommandReturnsIndexAndStampsTerm(t *testing.T) {
 	n := testNode(t, "n1")
 	n.currentTerm = 3
