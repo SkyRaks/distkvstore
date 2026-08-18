@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"sync"
+	"time"
 )
 
 // store is a concurrency-safe string/string map. Everything that touches the
@@ -29,6 +31,11 @@ func (s *store) put(k, v string) {
 	defer s.mu.Unlock()
 	s.m[k] = v
 }
+
+// commitTimeout bounds how long /put waits for a majority before giving up
+// and telling the client the write did not commit. Comfortably longer than
+// several heartbeat intervals, so ordinary replication is never cut short.
+const commitTimeout = 5 * time.Second
 
 // notLeaderResponse is the body returned when a write is rejected because
 // this node isn't the leader. LeaderID is "" if no leader is currently known
@@ -95,13 +102,71 @@ func (n *node) handlePut(w http.ResponseWriter, r *http.Request) {
 	// An absent value stores the empty string; that's a legitimate value.
 	index := n.appendCommand(key, q.Get("value"))
 	term := n.currentTerm
+	// Re-check commitability now that the log grew: in a single-node cluster
+	// the leader alone is already a majority, so the entry is committed the
+	// moment it's appended and no peer reply will ever arrive to notice.
+	// With peers this is a no-op -- their matchIndex is still behind.
+	n.advanceCommitIndex()
 	n.mu.Unlock()
 
-	// The entry reaches the map only via applyCommitted, once a majority
-	// holds it. Answering OK here is still premature -- Task 6 makes this
-	// wait for the commit before replying.
 	log.Printf("[%s] appended %s=%s at index %d (term %d)", n.id, key, q.Get("value"), index, term)
+
+	// Kick a replication round immediately instead of waiting for the next
+	// heartbeat tick.
+	select {
+	case n.replicateCh <- struct{}{}:
+	default:
+	}
+
+	// Bound the wait server-side. Without this the request hangs until the
+	// client gives up: a leader that loses contact with its majority keeps
+	// believing it's leader (Raft leaders don't step down just for silence),
+	// so nothing else would ever end the wait.
+	ctx, cancel := context.WithTimeout(r.Context(), commitTimeout)
+	defer cancel()
+
+	if !n.waitForCommit(ctx, index) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeJSON(w, notLeaderResponse{Error: "write not committed: no majority acknowledged in time"})
+		return
+	}
+
+	log.Printf("[%s] committed %s=%s at index %d", n.id, key, q.Get("value"), index)
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write([]byte("OK\n"))
+}
+
+// waitForCommit blocks until the entry at index is committed, the request is
+// cancelled, or this node stops being leader. Returns whether it committed.
+//
+// Polling rather than a sync.Cond broadcast: Cond over an RWMutex is awkward,
+// and at this scale a 5ms poll is invisible. The tradeoff is deliberate --
+// swap in a Cond if the write path ever gets hot.
+func (n *node) waitForCommit(ctx context.Context, index int) bool {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		n.mu.RLock()
+		committed := n.commitIndex >= index
+		stillLeader := n.role == leader
+		n.mu.RUnlock()
+
+		if committed {
+			return true
+		}
+		// Losing leadership mid-write means this entry may be overwritten by
+		// the next leader. Fail rather than leave the client hanging.
+		if !stillLeader {
+			return false
+		}
+
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
 }

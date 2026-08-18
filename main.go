@@ -65,6 +65,7 @@ func main() {
 		electionTimeoutMax: *electionTimeoutMax,
 		heartbeatInterval:  *heartbeatInterval,
 		resetCh:            make(chan struct{}, 1),
+		replicateCh:        make(chan struct{}, 1),
 	}
 	// Load before anything else touches currentTerm/votedFor: no HTTP server
 	// and no goroutines are running yet, so this needs no lock.

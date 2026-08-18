@@ -116,6 +116,13 @@ type node struct {
 	// no need to also start competing right now. Buffered size 1 with a
 	// non-blocking send so a burst of grants can't block the HTTP handler.
 	resetCh chan struct{}
+
+	// replicateCh nudges the leader's heartbeat loop to send a round right
+	// now rather than waiting for the next tick. Without it every /put would
+	// stall until the heartbeat interval elapsed. Buffered size 1 with a
+	// non-blocking send, same pattern as resetCh: a pending nudge already
+	// covers any later one.
+	replicateCh chan struct{}
 }
 
 // pingResponse is what GET /ping returns -- this node's identity plus its

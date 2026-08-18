@@ -203,6 +203,16 @@ func (n *node) runHeartbeats(ctx context.Context, term int) {
 				return
 			}
 			n.broadcastHeartbeat(ctx, term)
+		case <-n.replicateCh:
+			// A client write just landed; replicate it now rather than
+			// making the client wait out the rest of the tick.
+			n.mu.RLock()
+			stillLeader := n.role == leader && n.currentTerm == term
+			n.mu.RUnlock()
+			if !stillLeader {
+				return
+			}
+			n.broadcastHeartbeat(ctx, term)
 		}
 	}
 }
