@@ -24,6 +24,26 @@ func (n *node) lastLogTerm() int {
 	return n.log[len(n.log)-1].Term
 }
 
+// logIsUpToDate reports whether a candidate's log is at least as current as
+// this node's, per section 5.4.1 of the paper: compare last terms first, and
+// only on a tie does length decide.
+//
+// Term before length, and the order is not arbitrary. A longer log is not
+// automatically better -- a node can pile up entries from a term that never
+// committed anywhere, while a shorter log ending in a newer term reflects
+// what the cluster actually agreed on. This comparison is what enforces
+// Leader Completeness: a candidate missing a committed entry can never
+// assemble a majority, because every node holding that entry refuses it.
+//
+// Caller holds n.mu.
+func (n *node) logIsUpToDate(candidateLastIndex, candidateLastTerm int) bool {
+	ourTerm := n.lastLogTerm()
+	if candidateLastTerm != ourTerm {
+		return candidateLastTerm > ourTerm
+	}
+	return candidateLastIndex >= n.lastLogIndex()
+}
+
 // majorityMatchIndex is the highest log index that a majority of the cluster
 // (this leader plus its peers) is known to hold.
 //

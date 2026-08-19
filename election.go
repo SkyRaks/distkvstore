@@ -33,6 +33,11 @@ func (n *node) handleRequestVote(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `missing or invalid "term"/"candidateId" query parameter`, http.StatusBadRequest)
 		return
 	}
+	// Absent or unparseable means 0, which is correct for a candidate with an
+	// empty log -- and a candidate that omits them simply loses any vote from
+	// a node that has entries, which is the safe default.
+	lastLogIndex, _ := strconv.Atoi(q.Get("lastLogIndex"))
+	lastLogTerm, _ := strconv.Atoi(q.Get("lastLogTerm"))
 
 	n.mu.Lock()
 
@@ -51,7 +56,12 @@ func (n *node) handleRequestVote(w http.ResponseWriter, r *http.Request) {
 		n.role = follower
 	}
 
-	granted := n.votedFor == "" || n.votedFor == candidateID
+	// Two conditions, both required: at most one vote per term, and the
+	// candidate's log must be at least as up to date as ours. The second is
+	// what stops a node with a stale log from winning and truncating
+	// entries the cluster already committed.
+	granted := (n.votedFor == "" || n.votedFor == candidateID) &&
+		n.logIsUpToDate(lastLogIndex, lastLogTerm)
 	if granted {
 		n.setTermAndVote(n.currentTerm, candidateID)
 	}
@@ -214,7 +224,15 @@ func (n *node) startElection(ctx context.Context, term int) {
 // as a plain "not granted" rather than an error: an unreachable peer is
 // normal, and simply doesn't count toward the majority.
 func (n *node) requestVoteFrom(ctx context.Context, peer string, term int) requestVoteResponse {
-	url := "http://" + peer + "/request-vote?term=" + strconv.Itoa(term) + "&candidateId=" + n.id
+	n.mu.RLock()
+	lastIndex, lastTerm := n.lastLogIndex(), n.lastLogTerm()
+	n.mu.RUnlock()
+
+	url := "http://" + peer + "/request-vote" +
+		"?term=" + strconv.Itoa(term) +
+		"&candidateId=" + n.id +
+		"&lastLogIndex=" + strconv.Itoa(lastIndex) +
+		"&lastLogTerm=" + strconv.Itoa(lastTerm)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
