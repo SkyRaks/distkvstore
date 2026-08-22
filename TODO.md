@@ -120,7 +120,7 @@ ever actually bites.
 ## 3. Log replication -- Raft's second pillar -- DONE
 
 Built over six increments; plan in
-[docs/superpowers/plans/2026-08-17-log-replication.md](docs/superpowers/plans/2026-08-17-log-replication.md).
+[docs/plans/2026-08-17-log-replication.md](docs/plans/2026-08-17-log-replication.md).
 
 **What exists now.** `log[]`, `commitIndex`, `lastApplied`, and the leader's
 `nextIndex[]`/`matchIndex[]` ([raft.go](raft.go)); the log helpers in
@@ -152,7 +152,7 @@ already a majority of one -- could never commit and `/put` hung forever.
 `handlePut` now re-checks commitability after appending. Caught by a
 hanging unit test.
 
-**Verified:** 34 unit tests, `-race` clean. 3-node runs confirmed: writes
+**Verified:** 37 unit tests, `-race` clean. 3-node runs confirmed: writes
 replicate to all nodes; killing the leader preserves every committed write;
 a node restarted with an empty log is rebuilt from scratch by the leader;
 and with both followers killed the leader correctly returns 503 rather than
