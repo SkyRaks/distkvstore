@@ -1,6 +1,9 @@
 package main
 
-import "sort"
+import (
+	"fmt"
+	"sort"
+)
 
 // This file holds the pure log helpers shared by both Raft RPCs:
 // AppendEntries uses them to decide whether a follower's log lines up with
@@ -106,6 +109,7 @@ func (n *node) applyCommitted() {
 		entry := n.log[n.lastApplied]
 		n.store.put(entry.Key, entry.Value)
 	}
+	fmt.Printf("applied log entries up to index %d (term %d)", n.lastApplied, n.commitIndex)
 }
 
 // truncateAndAppend splices entries into the log starting right after
