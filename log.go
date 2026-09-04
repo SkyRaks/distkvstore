@@ -110,6 +110,7 @@ func (n *node) applyCommitted() {
 		n.store.put(entry.Key, entry.Value)
 	}
 	fmt.Printf("applied log entries up to index %d (term %d)", n.lastApplied, n.commitIndex)
+	fmt.Print("i want to make merge conflict on purpose")
 }
 
 // truncateAndAppend splices entries into the log starting right after
