@@ -233,6 +233,40 @@ a node with a stale log mathematically cannot win.
 
 ---
 
+## Containerization gaps (found while dockerizing)
+
+- **Graceful shutdown only caught SIGINT, not SIGTERM -- FIXED.**
+  `signal.NotifyContext` ([main.go:90](main.go#L90)) now also registers
+  `syscall.SIGTERM` alongside `os.Interrupt`, so `docker stop` and a
+  Kubernetes pod termination (both send SIGTERM, not SIGINT) trigger the
+  same graceful `srv.Shutdown` path ([main.go:105-113](main.go#L105)) that
+  Ctrl+C already did locally.
+
+- **Dockerfile builds and runs a mismatched binary name.** The build stage
+  compiles to `/docker-gs-ping` ([Dockerfile:10](Dockerfile#L10)) but
+  `ENTRYPOINT` runs `/raft-node` ([Dockerfile:27](Dockerfile#L27)) --
+  leftover names from a different tutorial this was started from. Container
+  fails to start ("no such file or directory") until these agree.
+
+- **`-peers` as documented assumes a shared network namespace.** The README
+  quick start passes `-peers localhost:8081,...`, which only resolves inside
+  one host's/process's network namespace. Each container gets its own, so
+  peer addresses need to be reachable hostnames -- a Compose service name, or
+  later a Kubernetes headless-Service/StatefulSet DNS name -- instead of
+  `localhost`. No code change, just how `-peers`/`-addr` get invoked at
+  container start, but worth documenting since `localhost` silently stops
+  working.
+
+- **Persisted state needs an explicit volume, or it's lost every restart.**
+  `<state-dir>/<id>.state.json` ([persist.go](persist.go)) already survives a
+  *process* restart on bare metal because the directory just sits on disk.
+  A container's filesystem is ephemeral by default, so without a mounted
+  volume, `currentTerm`/`votedFor` reset to zero on every container
+  restart -- reopening the double-vote-after-crash bug that item 2 above
+  was written to close.
+
+---
+
 ## Deliberately out of scope (real Raft, not needed for this project)
 
 - **Cluster membership changes** (paper §6, joint consensus).

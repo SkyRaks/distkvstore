@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -35,6 +36,7 @@ func main() {
 	addr := flag.String("addr", ":8080", "address to listen on")
 	id := flag.String("id", "", "unique node id, e.g. node1 (required)")
 	peers := flag.String("peers", "", "comma-separated addresses of the other nodes")
+
 	stateDir := flag.String("state-dir", "data", "directory to persist currentTerm/votedFor in, as <state-dir>/<id>.state.json")
 	slow := flag.Duration("slow", 0, "delay before answering /ping, e.g. 3s (simulates a hung node)")
 	electionTimeoutMin := flag.Duration("election-timeout-min", 3*time.Second, "minimum election timeout")
@@ -85,7 +87,7 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	go n.runElectionTimer(ctx)
