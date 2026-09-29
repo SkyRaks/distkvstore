@@ -242,20 +242,21 @@ a node with a stale log mathematically cannot win.
   same graceful `srv.Shutdown` path ([main.go:105-113](main.go#L105)) that
   Ctrl+C already did locally.
 
-- **Dockerfile builds and runs a mismatched binary name.** The build stage
-  compiles to `/docker-gs-ping` ([Dockerfile:10](Dockerfile#L10)) but
-  `ENTRYPOINT` runs `/raft-node` ([Dockerfile:27](Dockerfile#L27)) --
-  leftover names from a different tutorial this was started from. Container
-  fails to start ("no such file or directory") until these agree.
+- **Dockerfile builds and runs a mismatched binary name -- DONE.** The
+  build stage compiles to `/docker-gs-ping` ([Dockerfile:10](Dockerfile#L10))
+  and the final stage's `COPY --from=build-stage /docker-gs-ping /raft-node`
+  ([Dockerfile:18](Dockerfile#L18)) renames it on copy, so `ENTRYPOINT
+  ["/raft-node"]` now matches. Verified: `docker compose up` starts all
+  three containers without a "no such file or directory" failure.
 
-- **`-peers` as documented assumes a shared network namespace.** The README
-  quick start passes `-peers localhost:8081,...`, which only resolves inside
-  one host's/process's network namespace. Each container gets its own, so
-  peer addresses need to be reachable hostnames -- a Compose service name, or
-  later a Kubernetes headless-Service/StatefulSet DNS name -- instead of
-  `localhost`. No code change, just how `-peers`/`-addr` get invoked at
-  container start, but worth documenting since `localhost` silently stops
-  working.
+- **`-peers` as documented assumes a shared network namespace -- DONE for
+  Compose.** [docker-compose.yml](docker-compose.yml) gives each node its
+  own service (`node1`/`node2`/`node3`), and `-peers` uses the Compose
+  service-name DNS (e.g. `node2:8081,node3:8082`) instead of `localhost`.
+  Verified: a 3-container `docker compose up` elected a leader and
+  replicated a write across all three. Still open for a future Kubernetes
+  move -- service names there are a different DNS shape
+  (headless-Service/StatefulSet), not Compose's.
 
 - **Persisted state needs an explicit volume, or it's lost every restart.**
   `<state-dir>/<id>.state.json` ([persist.go](persist.go)) already survives a
@@ -263,7 +264,34 @@ a node with a stale log mathematically cannot win.
   A container's filesystem is ephemeral by default, so without a mounted
   volume, `currentTerm`/`votedFor` reset to zero on every container
   restart -- reopening the double-vote-after-crash bug that item 2 above
-  was written to close.
+  was written to close. **Still open** -- current
+  [docker-compose.yml](docker-compose.yml) declares no `volumes:` for any
+  of the three services.
+
+- **`ports:` mapping needs both sides set correctly, per service --
+  learned the hard way.** Docker's `"HOST:CONTAINER"` syntax has two
+  independent numbers: container-side must match that node's own `-addr`,
+  and host-side must be unique per service (all three can't publish to the
+  same host port at once). Getting either one wrong produces a different
+  failure -- container-side wrong means the peer/host traffic lands on a
+  port nothing listens on; host-side collision means `docker compose up`
+  fails outright with "port is already allocated". Not a code bug, just
+  worth remembering next time a new service is added to the compose file.
+
+- **Confirmed in practice: a follower's `/get` can lag ~1 heartbeat
+  interval after a write.** Not a new bug -- this is the existing
+  "follower `/get` can be stale by one round" gap noted above, just
+  actually observed for the first time via a real 3-container
+  `docker compose` cluster: `PUT` to the leader followed immediately by
+  `GET` on a follower returned `404 key not found`, and succeeded a few
+  seconds later. Consistent with the default `-heartbeat-interval` of `1s`
+  ([main.go:44](main.go#L44)) -- large enough to be visible to a human
+  typing `curl` commands by hand, not indicative of anything actually
+  broken. **Follow-up for next session:** decide whether to lower the
+  default heartbeat interval (or pass a shorter one via each service's
+  `command:` in Compose) so manual demos don't trip over this, purely for
+  demo ergonomics -- the underlying staleness is correct Raft and is
+  already tracked as out of scope for linearizable reads.
 
 ---
 
