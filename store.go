@@ -85,8 +85,12 @@ func (n *node) handlePut(w http.ResponseWriter, r *http.Request) {
 
 	q := r.URL.Query()
 	key := q.Get("key")
+	value := q.Get("value")
 	if key == "" {
 		http.Error(w, `missing "key" query parameter`, http.StatusBadRequest)
+		return
+	} else if value == "" {
+		http.Error(w, `missing "value" query parameter`, http.StatusBadRequest)
 		return
 	}
 

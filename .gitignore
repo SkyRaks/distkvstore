@@ -2,3 +2,4 @@
 
 # Runtime node state (currentTerm/votedFor), written by -state-dir.
 data/
+raft-logs/
