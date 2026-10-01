@@ -246,60 +246,15 @@ a node with a stale log mathematically cannot win.
 
 ## Containerization gaps (found while dockerizing)
 
-- **Graceful shutdown only caught SIGINT, not SIGTERM -- FIXED.**
-  `signal.NotifyContext` ([main.go:90](main.go#L90)) now also registers
-  `syscall.SIGTERM` alongside `os.Interrupt`, so `docker stop` and a
-  Kubernetes pod termination (both send SIGTERM, not SIGINT) trigger the
-  same graceful `srv.Shutdown` path ([main.go:105-113](main.go#L105)) that
-  Ctrl+C already did locally.
-
-- **Dockerfile builds and runs a mismatched binary name -- DONE.** The
-  build stage compiles to `/docker-gs-ping` ([Dockerfile:10](Dockerfile#L10))
-  and the final stage's `COPY --from=build-stage /docker-gs-ping /raft-node`
-  ([Dockerfile:18](Dockerfile#L18)) renames it on copy, so `ENTRYPOINT
-  ["/raft-node"]` now matches. Verified: `docker compose up` starts all
-  three containers without a "no such file or directory" failure.
-
-- **`-peers` as documented assumes a shared network namespace -- DONE for
-  Compose.** [docker-compose.yml](docker-compose.yml) gives each node its
-  own service (`node1`/`node2`/`node3`), and `-peers` uses the Compose
-  service-name DNS (e.g. `node2:8081,node3:8082`) instead of `localhost`.
-  Verified: a 3-container `docker compose up` elected a leader and
-  replicated a write across all three. Still open for a future Kubernetes
-  move -- service names there are a different DNS shape
-  (headless-Service/StatefulSet), not Compose's.
-
-- **Persisted state needs an explicit volume, or it's lost every restart --
-  DONE for Compose.** `<state-dir>/<id>.state.json` ([persist.go](persist.go))
-  survives a *process* restart on bare metal because the directory sits on
-  disk, but a container's filesystem is ephemeral, so without a mounted
-  volume `currentTerm`/`votedFor` reset on every container restart --
-  reopening the double-vote-after-crash bug that item 2 was written to
-  close. [docker-compose.yml](docker-compose.yml) now bind-mounts a
-  separate folder per node (`./raft-logs/nodeN` -> `/nodeN`) and passes the
-  matching `-state-dir /nodeN` in each `command:`. Verified: after a
-  cluster run, `raft-logs/node{1,2,3}/<id>.state.json` exist on the host
-  with `current_term` 2 / `voted_for` node2.
-  *Rule learned:* the volume TARGET (container side) and `-state-dir` must
-  be the exact same path; the SOURCE is a host **folder** starting with
-  `./`, never a file. A single-part entry (`- raft-logs`) is an anonymous
-  volume, not a link to a project folder.
-  *Still open for Kubernetes:* the equivalent there is a StatefulSet with
-  `volumeClaimTemplates` (one PVC per pod); a Deployment gives no stable
-  per-pod storage.
-
-- **Stray empty folders `raft-logs/node1/node2/node3`.** Left over from an
-  earlier misconfigured compose run (inferred, not proven); the current
-  config cannot create them. Safe to delete by hand.
-
-- **`/put` accepts a missing `value`.** A request with `key` only (e.g. an
-  unquoted `&` in curl, which the shell treats as "run in background")
-  returns `OK` and stores an empty value. Decide whether `handlePut` should
-  reject it with 400. Also: always quote the URL in curl.
-
-- **Check uncommitted edits in `store.go`.** `git status` showed it modified
-  alongside `docker-compose.yml`/`.gitignore`; confirm the change is
-  intentional before committing.
+- **Kubernetes equivalents of the finished Compose setup are still open.**
+  Compose is done (SIGTERM shutdown, Dockerfile entrypoint, per-service
+  peer DNS, per-node state volumes -- all verified with a 3-container
+  cluster), but two pieces don't carry over to Kubernetes:
+  - *Peer addressing:* Compose service names (`node2:8081`) become
+    headless-Service/StatefulSet pod DNS names, a different shape.
+  - *Durable state:* the equivalent of the bind mounts is a StatefulSet with
+    `volumeClaimTemplates` (one PVC per pod); a Deployment gives no stable
+    per-pod storage, which would reopen the double-vote-after-crash bug.
 
 - **`ports:` mapping needs both sides set correctly, per service --
   learned the hard way.** Docker's `"HOST:CONTAINER"` syntax has two

@@ -13,9 +13,12 @@ import (
 // node (role, leaderID, ...) is safe to lose on restart -- a node that comes
 // back up as a follower with no known leader will simply relearn both from
 // the next heartbeat or election.
+
 type persistedState struct {
 	CurrentTerm int    `json:"current_term"`
 	VotedFor    string `json:"voted_for"`
+	// what if we would have array with logs like oliver: 22, ryan: 19...
+	NodeLogs []logEntry `json:"node_log"`
 }
 
 func (n *node) statePath() string {
@@ -42,7 +45,7 @@ func (n *node) setTermAndVote(term int, votedFor string) {
 // then atomic rename, deliberately left out of this increment to keep it
 // focused on making state durable *at all* first.
 func (n *node) savePersistedState() {
-	data, err := json.Marshal(persistedState{CurrentTerm: n.currentTerm, VotedFor: n.votedFor})
+	data, err := json.Marshal(persistedState{CurrentTerm: n.currentTerm, VotedFor: n.votedFor, NodeLogs: n.log})
 	if err != nil {
 		log.Fatalf("[%s] marshal persisted state: %v", n.id, err)
 	}
