@@ -123,6 +123,7 @@ func (n *node) applyCommitted() {
 //
 // Caller holds n.mu.
 func (n *node) truncateAndAppend(prevLogIndex int, entries []logEntry) {
+	changed := false
 	for i, entry := range entries {
 		index := prevLogIndex + 1 + i
 
@@ -134,6 +135,10 @@ func (n *node) truncateAndAppend(prevLogIndex int, entries []logEntry) {
 			n.log = n.log[:index]
 		}
 		n.log = append(n.log, entry)
+		changed = true
+	}
+	if changed {
+		n.savePersistedState()
 	}
 }
 
@@ -145,6 +150,7 @@ func (n *node) truncateAndAppend(prevLogIndex int, entries []logEntry) {
 // Caller holds n.mu.
 func (n *node) appendCommand(key, value string) int {
 	n.log = append(n.log, logEntry{Term: n.currentTerm, Key: key, Value: value})
+	n.savePersistedState()
 	return n.lastLogIndex()
 }
 
