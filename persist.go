@@ -8,7 +8,7 @@ import (
 )
 
 // persistedState is the subset of a node's Raft state that must survive a
-// crash: Figure 2 of the paper marks currentTerm and votedFor as persistent,
+// crash: Figure 2 of the per marks currentTerm and votedFor as persistent,
 // written to stable storage before responding to any RPC. Everything else on
 // node (role, leaderID, ...) is safe to lose on restart -- a node that comes
 // back up as a follower with no known leader will simply relearn both from
@@ -76,5 +76,7 @@ func (n *node) loadPersistedState() {
 	}
 	n.currentTerm = s.CurrentTerm
 	n.votedFor = s.VotedFor
+	n.log = s.NodeLogs
+	n.applyCommitted()
 	log.Printf("[%s] loaded persisted state: term=%d voted_for=%q", n.id, n.currentTerm, n.votedFor)
 }
