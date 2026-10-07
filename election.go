@@ -214,6 +214,7 @@ func (n *node) startElection(ctx context.Context, term int) {
 		n.nextIndex[peer] = n.lastLogIndex() + 1 // optimistic: assume they match us
 		n.matchIndex[peer] = 0                   // pessimistic: we know nothing yet
 	}
+	n.appendCommand("", "")
 
 	log.Printf("[%s] won election for term %d with %d/%d votes -> leader", n.id, term, votes, needed)
 

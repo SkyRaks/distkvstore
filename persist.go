@@ -77,6 +77,5 @@ func (n *node) loadPersistedState() {
 	n.currentTerm = s.CurrentTerm
 	n.votedFor = s.VotedFor
 	n.log = s.NodeLogs
-	n.applyCommitted()
 	log.Printf("[%s] loaded persisted state: term=%d voted_for=%q", n.id, n.currentTerm, n.votedFor)
 }

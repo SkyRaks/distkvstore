@@ -6,8 +6,8 @@ single increment, and later ones assume the earlier ones are done.
 Current state: leader election and log replication both work. A `/put` is
 appended to the leader's log, replicated to followers, and only answered
 `OK` once a majority holds it -- so a committed write survives the leader
-dying. Remaining gap: the log itself is in-memory, so it does not survive a
-majority of nodes restarting at once (see Bugs below).
+dying, and the log is persisted, so it survives a majority of nodes
+restarting at once too.
 
 ---
 
@@ -178,29 +178,85 @@ majority; any election needs a majority; those two majorities overlap; and
 the overlapping node refuses to vote for a candidate missing the entry. So
 a node with a stale log mathematically cannot win.
 
+## 5. Persist the log and rebuild the map on restart -- DONE
+
+**The problem.** Figure 2 marks `log[]` as persistent state alongside
+`currentTerm`/`votedFor`, but the log was in memory only. A committed write
+survived the leader crashing, but not a majority restarting at once -- they
+came back with empty logs, and a client that was told `OK` lost its write.
+
+**Fix.** `persistedState` ([persist.go](persist.go)) now carries the log
+(`node_log`), written by `savePersistedState` on every log change
+(`appendCommand`, `truncateAndAppend`) and restored by `loadPersistedState`.
+The KV map is *not* persisted -- it is rebuilt by `applyCommitted` replaying
+committed entries, which is the invariant this project is built on.
+
+**Three things learned getting the map back after a full restart:**
+- `commitIndex` and `lastApplied` are volatile (Figure 2) and correctly
+  restart at 0. Don't "fix" this by setting `lastApplied` at load time: it
+  makes `applyCommitted` believe entries are applied when the map is empty,
+  so nothing is ever replayed. A restarted node learns the commit point from
+  `leaderCommit` on the next heartbeat.
+- The Figure 8 guard means a new leader cannot commit old-term entries by
+  counting replicas, so after a full restart the old entries sat
+  uncommitted until the next `/put`. Fix: a new leader appends a **no-op
+  entry** (empty key) in its own term right after winning
+  ([election.go](election.go)); committing it commits everything before it.
+  `applyCommitted` skips empty-key entries; `/put` rejects empty keys, so a
+  client can never produce one.
+- `loadPersistedState` replaces `n.log` wholesale, so the `log[0]` sentinel
+  now depends on the file being right. A state file missing the sentinel
+  shifts every index by one and silently drops the first entry (`oliver`
+  vanished while `ryan` loaded). See the open item below.
+
+**Verified:** full 3-node restart brings every key back on every node.
+
+*Left out of this increment:* the log is still rewritten as one JSON blob per
+change, with no `File.Sync()` and no write-to-temp-then-rename, so it is
+neither efficient nor torn-write safe. A better design would be append-only
+records (one JSON line per entry, optional checksum), `Sync()` before
+acknowledging, and a way to truncate a conflicting suffix. Revisit when it
+bites.
+
+## 6. Reorganize the project into folders for readability -- TODO
+
+**The problem.** Everything -- Raft logic, KV store, HTTP handlers, tests,
+docs, Docker files -- sits in one flat directory, which is getting hard to
+scan.
+
+**Decision to settle first.** In Go a folder is a *package*. Moving `.go`
+files into subfolders is not a pure move like item 0 was: it forces
+export decisions (lowercase `node`, `store`, `logEntry` etc. become
+inaccessible across packages unless capitalized or wrapped in a constructor),
+and `main` would have to import them. This is the `raft/` split that item 0
+deliberately deferred. Pick one before moving anything:
+- *Non-Go files only:* leave all `.go` files in the root as-is and move just
+  docs, Docker/Compose files, and sample data into folders (e.g. `docs/`,
+  `deploy/`). No code changes, lowest risk.
+- *Real packages:* e.g. `raft/` (node, election, heartbeat, log, persist),
+  `kv/` (store), and a thin `main.go`. Better structure, touches every
+  identifier.
+
+**Watch for:** `Dockerfile` build context and `COPY` paths, `docker-compose.yml`
+volume/`build:` paths, the `data/` state dir default, relative links in
+README.md, TODO.md and CLAUDE.md (the file table there), and `go test ./...`
+still finding the tests.
+
 ---
 
 ## Bugs and smaller gaps
 
-- **The log itself is not persisted.** Figure 2 marks `log[]` as persistent
-  state alongside `currentTerm`/`votedFor`, but [log.go](log.go) keeps it in
-  memory only. A committed write survives the leader crashing, but not a
-  majority restarting at once -- they come back with empty logs and no
-  memory of the entry, and a client that was told `OK` loses its write.
-  Fix: extend [persist.go](persist.go) to write the log, ideally append-only
-  rather than rewriting a JSON blob per entry. **This is the largest
-  remaining correctness gap.**
-  *Status:* the Compose volumes are in place, so there is now durable
-  storage to write into -- confirmed `<id>.state.json` holds only
-  `current_term`/`voted_for`, so an entry like `oliver=22` is not on disk.
-  *Next session -- design decisions to settle before coding:*
-  record format (length-prefixed or one JSON line per entry, optional
-  checksum for a torn last write); `File.Sync()` before acknowledging;
-  how to handle truncating a conflicting suffix (rewrite, `File.Truncate`,
-  or a truncate marker); replay in `loadPersistedState` on startup
-  (`commitIndex`/`lastApplied` need no persisting -- the map is rebuilt by
-  `applyCommitted`); persist before replying to `AppendEntries` and before
-  the leader counts its own entry toward the majority.
+- **A state file without the `log[0]` sentinel loads silently wrong.**
+  `loadPersistedState` trusts the file, so a log missing the leading
+  `{term 0}` entry shifts every index by one and drops the first real entry
+  with no warning. Options: persist only `log[1:]` and rebuild the sentinel
+  on load (it can then never go missing), or keep it in the file and refuse
+  to start if `NodeLogs` is empty or `NodeLogs[0].Term != 0`, matching the
+  existing "refuse to start on a corrupt file" rule.
+
+- **Leftover debug output.** `fmt.Print` lines in
+  [persist.go](persist.go) and [log.go](log.go) (`applyCommitted`) should be
+  removed, and `gofmt -w log.go` run (it is currently flagged).
 
 - **Single-node cluster never elects a leader.**
   `startElection` returns early when `len(peers) == 0`
