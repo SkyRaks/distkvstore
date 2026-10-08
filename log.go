@@ -104,13 +104,9 @@ func (n *node) advanceCommitIndex() {
 // Caller holds n.mu (write); this takes store.mu internally. Lock ordering
 // is n.mu then store.mu, never the reverse.
 func (n *node) applyCommitted() {
-	// fmt.Print("THIS IS COMMIT INDEX: ", n.commitIndex) // fuck, it is zero
-	fmt.Print("THIS IS LAST APPLIED: ", n.lastApplied)
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
-		// THIS IS NODELOGS: [{0  } {7 oliver 22} {7 ryan 19}
 		entry := n.log[n.lastApplied]
-		fmt.Print("THIS IS ENTRY: ", entry)
 		if entry.Key == "" {
 			continue // leader no-op: occupies a log slot, writes nothing
 		}

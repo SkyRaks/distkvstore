@@ -1,237 +1,93 @@
 # TODO
 
-Roadmap from the Raft-paper gap analysis. Ordered: each item is roughly a
-single increment, and later ones assume the earlier ones are done.
+Open work only; finished items are removed once done (git history has them).
 
-Current state: leader election and log replication both work. A `/put` is
-appended to the leader's log, replicated to followers, and only answered
-`OK` once a majority holds it -- so a committed write survives the leader
-dying, and the log is persisted, so it survives a majority of nodes
-restarting at once too.
+Current state: leader election, log replication, and log persistence all work.
+A `/put` is answered `OK` only once a majority holds it, and the log survives
+restarts, including a majority restarting at once.
 
 ---
 
-## 0. Split `main.go` into multiple files -- DONE
+## 1. Kubernetes deployment
 
-**The problem.** `main.go` was ~730 lines holding four unrelated
-concerns: the KV store, the node/type definitions, elections, and heartbeats.
-Hard to navigate, and every item below adds to it.
+Review of the project for blockers. Nothing stops the code from running on
+Kubernetes, but item 1a must be settled first or the majority math is
+silently wrong.
 
-**Fix.** Six files, all staying in `package main` -- a pure move, no logic
-changes, no signature changes, nothing newly exported (Go doesn't care which
-file a function lives in within a package):
+### 1a. Self in `-peers` breaks majorities -- MUST FIX FIRST
 
-| File | Contents |
-| --- | --- |
-| [store.go](store.go) | `store`, `newStore`, `get`, `put`, `handleGet`, `handlePut` |
-| [raft.go](raft.go) | `role` + `String()`, `node` struct, the four request/response types |
-| [election.go](election.go) | `randomElectionTimeout`, `runElectionTimer`, `startElection`, `requestVoteFrom`, `handleRequestVote` |
-| [heartbeat.go](heartbeat.go) | `runHeartbeats`, `broadcastHeartbeat`, `appendEntriesFrom`, `handleAppendEntries` |
-| [ping.go](ping.go) | `handlePing`, `handlePingPeer`, `pingOne` |
-| [main.go](main.go) | flags, `node` construction, route registration, server + shutdown, `writeJSON`, `parsePeers` |
+A StatefulSet has one pod template, so every pod gets the same flags, and the
+natural `-peers` value lists all three FQDNs, including the node itself.
+Compose avoids this because each service has its own `command:` listing only
+the *other* nodes. The code assumes `peers` excludes self:
+- `needed := (len(n.peers)+1)/2 + 1` ([election.go:162](election.go#L162))
+  computes a 4-node cluster and needs 3 votes.
+- `majorityMatchIndex` ([log.go](log.go)) uses `len(n.peers)+1` the same way.
+- The node sends `RequestVote`/`AppendEntries` to itself over HTTP.
 
-Organizing principle: **one file per Raft RPC, holding both sides of it** --
-`election.go` has both the candidate asking (`requestVoteFrom`) and the voter
-answering (`handleRequestVote`); `heartbeat.go` likewise. Those pairs only
-make sense read together, since each side's rules mirror the other's.
-Splitting by "handlers vs. clients" would scatter each RPC across two files.
+Nothing crashes; it is the same silent split-brain as the "no agreement on
+cluster configuration" bug below. Options:
+- *Filter self out of `peers` at startup* (recommended): the pod name is the
+  DNS prefix (`raft-0.raft...`), so a peer whose host starts with `-id` is
+  self. Do it once, before `node` is built, so both majority calculations stay
+  correct.
+- *Per-pod args from a shell entrypoint* (debian-slim has `sh`): works, hacky.
+- *Three separate StatefulSets/Deployments*: Compose's shape, but gives up
+  what StatefulSets are for.
 
-`writeJSON` and `parsePeers` stay in `main.go` rather than getting a
-`util.go`, which tends to become a junk drawer.
+### 1b. Manifest checklist (no code changes)
 
-**Why first:** it invalidated every `main.go:NNN` reference in this file
-(~12 of them), so the references below were updated in the same commit rather
-than being left to go misleading.
+- **`-id`:** env `POD_NAME` from the downward API (`metadata.name`), then
+  `args: ["-id", "$(POD_NAME)"]`. Pod name as id also makes `leader_id` in the
+  409 response usable as a DNS prefix.
+- **`-state-dir`:** defaults to `data`, relative to `/` -- ephemeral. Point it
+  at the PVC mount path. Mandatory (reopens the double-vote-after-crash bug
+  otherwise).
+- **Storage:** StatefulSet with `volumeClaimTemplates`, one PVC per pod. Not a
+  Deployment.
+- **Peers:** `raft-N.<headless-svc>.<ns>.svc.cluster.local:8080`. All pods can
+  share one port, so the 8080/8081/8082 scheme is not needed.
+- **Headless Service:** `clusterIP: None`, plus `publishNotReadyAddresses:
+  true`.
+- **Startup:** `podManagementPolicy: Parallel`; the default `OrderedReady`
+  waits for pod-0 Ready before creating pod-1, which suits a consensus group
+  badly. Failed peer lookups just count as "vote not granted", so startup
+  races are harmless.
+- **Probes:** no `/healthz`, but `/ping` always returns 200 -- use it for
+  liveness and readiness. Do not gate readiness on having a leader. Do not
+  pass `-slow`.
+- **Image:** push to a registry, or load into kind/minikube
+  (`kind load docker-image` / `minikube image load`) and set `imagePullPolicy`.
+- **Replicas:** fixed at 3. Membership is static, so no scaling and no HPA.
 
-**Verified:** `gofmt -l` clean, `go vet ./...` and `go build ./...` clean, plus
-a 3-node run: node3 won term 1 unanimously, term held steady for 8s with no
-churn, `/get` `/put` `/ping-peer` unchanged, and killing node3 produced a
-clean failover to node1 in term 2 with node2 agreeing. A pure move should be
-provably identical, so this was demonstrated rather than assumed.
+### 1c. Known sharp edges on Kubernetes (not blockers)
 
-*Considered and deferred:* moving Raft into a real `raft/` package with
-`main.go` as a thin binary. Better long-term structure, but it forces
-export decisions and touches every identifier. Revisit if the code grows
-again after log replication.
+- **Writes through a ClusterIP Service mostly fail.** It load-balances, so
+  about 2 in 3 `PUT`s hit a follower and get 409 with `leader_id`. Retry using
+  `leader_id` as the pod DNS name, or `kubectl port-forward` to the leader.
+- **Follower `/get` lags ~1 heartbeat** (same staleness seen in Compose).
+- **Torn state-file write -> CrashLoopBackOff.** `savePersistedState` is a
+  plain `WriteFile` (no fsync, no atomic rename) and a parse failure is
+  `log.Fatal` by design. Pod kills and evictions make a mid-write kill likelier
+  than on a laptop. Recovery: wipe that pod's PVC; the leader rebuilds it.
+- **No `.dockerignore`.** `COPY . .` sends `.git`, `raft-logs/`, `data/` and
+  the `.exe` to the builder. Slows the build only; the final stage copies just
+  the binary. The image runs as root, which sidesteps PVC permission issues
+  for now.
 
-## 1. Connect `/put` to Raft (leader-only writes) -- DONE
-
-**The problem.** `/get` and `/put` were registered as `*store` methods, so
-`handlePut` had no access to `role`, `currentTerm`, or `peers` -- it
-structurally *could not* consult Raft. Every node accepted writes, each
-write landed only in that node's local map, and nothing replicated. Three
-running nodes were three silently diverging key-value stores.
-
-**Fix.** Moved `handleGet`/`handlePut` onto `*node`
-([store.go](store.go)), keeping `store` itself as the storage type
-(`n.store.get`/`n.store.put`). `handlePut` now rejects writes unless
-`n.role == leader`, returning `409 Conflict` with a JSON body
-`{"error":"not the leader","leader_id":"<id or empty>"}` -- empty when no
-leader is currently known (e.g. mid-election), telling the client to just
-retry shortly rather than pointing it anywhere.
-
-This doesn't add replication -- a write still only lands on one node's map,
-it's just now the *correct* node -- but it makes the cluster honest about
-what it can currently guarantee, and forces the leader-redirect problem
-that log replication needs anyway.
-
-**Verified:** `gofmt`/`vet`/`build` clean. 3-node run: writes to the leader
-succeed and are readable; writes to either follower are rejected with
-`leader_id` pointing at the real leader; after killing the leader, the new
-leader accepts writes and the remaining follower's rejection correctly
-repoints at the new leader.
-
-## 2. Persist `currentTerm` and `votedFor` -- DONE
-
-**The problem.** Figure 2 of the Raft paper marks these as persistent state,
-written to stable storage *before* responding to any RPC. They were
-in-memory only. This was a genuine safety bug, not a nicety: a node that
-votes in term 5, crashes, and restarts comes back with no memory of voting,
-votes a second time in the same term, and lets two different candidates
-each collect a majority -> **two leaders in one term**, breaking Election
-Safety.
-
-**Fix.** New [persist.go](persist.go): `n.setTermAndVote(term, votedFor)`
-mutates both fields and writes them to `<state-dir>/<id>.state.json` before
-returning, so "changed in memory" and "flushed to disk" never drift apart.
-All five call sites that used to assign `currentTerm`/`votedFor` directly
-(`handleRequestVote`, `handleAppendEntries`, `runElectionTimer`,
-`startElection`, `broadcastHeartbeat`) now go through it. `main.go` gained
-a `-state-dir` flag (default `.`) and calls `n.loadPersistedState()` at
-startup, before any goroutine runs. A state file that exists but won't
-parse is treated as a real problem, not a fresh start: `log.Fatal` rather
-than silently resetting to term 0, since silently resetting is exactly the
-bug this item closes.
-
-**Verified:** restart preserves term/vote (confirmed via the state file
-and `/ping`). The actual double-vote-after-crash scenario was reproduced
-and fixed: a node granted a vote in term 5, was killed and restarted, and
-then correctly *rejected* a second vote request for term 5 (would have
-been granted before this fix). Corrupt state file -> `log.Fatal`, exit
-code 1. 3-node election, leader-only writes, and failover all still work
-with three nodes sharing one `-state-dir`. `gofmt`/`vet`/`build` clean,
-`-race` clean under concurrent stress across all endpoints.
-
-*Left out of this increment:* the write in `savePersistedState` is a plain
-`os.WriteFile`, not write-to-temp-then-atomic-rename -- a crash mid-write
-could in principle leave a corrupt file. Noted in the code; revisit if it
-ever actually bites.
-
-## 3. Log replication -- Raft's second pillar -- DONE
-
-Built over six increments; plan in
-[docs/plans/2026-08-17-log-replication.md](docs/plans/2026-08-17-log-replication.md).
-
-**What exists now.** `log[]`, `commitIndex`, `lastApplied`, and the leader's
-`nextIndex[]`/`matchIndex[]` ([raft.go](raft.go)); the log helpers in
-[log.go](log.go). `AppendEntries` moved from query params to **POST + JSON**
-and now carries `prevLogIndex`, `prevLogTerm`, `entries[]` and
-`leaderCommit` -- a heartbeat is simply the same call with `entries` empty.
-
-**The mechanism.** A client write reaches only the leader, which appends it
-to its log, replicates via `AppendEntries`, waits for a **majority to
-acknowledge**, marks it committed, applies it to the map, and only then
-answers the client. Followers apply entries once `leaderCommit` says it is
-safe, clamped to their own last index. `/put` returns `503` if no majority
-acknowledges within `commitTimeout`.
-
-The log is 1-indexed with `log[0]` a permanent sentinel, so a Go slice index
-equals a Raft log index -- no `index-1` arithmetic anywhere.
-
-**Two subtleties worth remembering:**
-- A follower that rejects for log mismatch still recognizes the leader and
-  resets its election timer. Otherwise it would start pointless elections
-  against a healthy leader while waiting to be repaired.
-- Figure 8: a leader may only commit an entry from its **own** term by
-  counting replicas. An older-term entry on a majority can still be
-  overwritten by a future leader.
-
-**Bug found while building this:** `advanceCommitIndex` was only reachable
-from a peer reply, so a single-node cluster -- where the lone leader is
-already a majority of one -- could never commit and `/put` hung forever.
-`handlePut` now re-checks commitability after appending. Caught by a
-hanging unit test.
-
-**Verified:** 37 unit tests, `-race` clean. 3-node runs confirmed: writes
-replicate to all nodes; killing the leader preserves every committed write;
-a node restarted with an empty log is rebuilt from scratch by the leader;
-and with both followers killed the leader correctly returns 503 rather than
-falsely claiming success.
-
-*Deliberate deviation:* `nextIndex` backs up one index per round rather than
-skipping a whole conflicting term. Slower to repair, obviously correct,
-irrelevant at this log size.
-
-## 4. Log up-to-dateness check in `RequestVote` -- DONE
-
-`RequestVote` now carries `lastLogIndex`/`lastLogTerm`, and a voter grants
-only if `votedFor` is null-or-candidateId **and** `logIsUpToDate`
-([log.go](log.go)) passes: last term first, length only as the tiebreak.
-
-Term before length is not arbitrary -- a longer log is not automatically
-better, since a node can accumulate entries from a term that never
-committed, while a shorter log ending in a newer term reflects what the
-cluster agreed on.
-
-This enforces the Leader Completeness Property. A committed entry is on a
-majority; any election needs a majority; those two majorities overlap; and
-the overlapping node refuses to vote for a candidate missing the entry. So
-a node with a stale log mathematically cannot win.
-
-## 5. Persist the log and rebuild the map on restart -- DONE
-
-**The problem.** Figure 2 marks `log[]` as persistent state alongside
-`currentTerm`/`votedFor`, but the log was in memory only. A committed write
-survived the leader crashing, but not a majority restarting at once -- they
-came back with empty logs, and a client that was told `OK` lost its write.
-
-**Fix.** `persistedState` ([persist.go](persist.go)) now carries the log
-(`node_log`), written by `savePersistedState` on every log change
-(`appendCommand`, `truncateAndAppend`) and restored by `loadPersistedState`.
-The KV map is *not* persisted -- it is rebuilt by `applyCommitted` replaying
-committed entries, which is the invariant this project is built on.
-
-**Three things learned getting the map back after a full restart:**
-- `commitIndex` and `lastApplied` are volatile (Figure 2) and correctly
-  restart at 0. Don't "fix" this by setting `lastApplied` at load time: it
-  makes `applyCommitted` believe entries are applied when the map is empty,
-  so nothing is ever replayed. A restarted node learns the commit point from
-  `leaderCommit` on the next heartbeat.
-- The Figure 8 guard means a new leader cannot commit old-term entries by
-  counting replicas, so after a full restart the old entries sat
-  uncommitted until the next `/put`. Fix: a new leader appends a **no-op
-  entry** (empty key) in its own term right after winning
-  ([election.go](election.go)); committing it commits everything before it.
-  `applyCommitted` skips empty-key entries; `/put` rejects empty keys, so a
-  client can never produce one.
-- `loadPersistedState` replaces `n.log` wholesale, so the `log[0]` sentinel
-  now depends on the file being right. A state file missing the sentinel
-  shifts every index by one and silently drops the first entry (`oliver`
-  vanished while `ryan` loaded). See the open item below.
-
-**Verified:** full 3-node restart brings every key back on every node.
-
-*Left out of this increment:* the log is still rewritten as one JSON blob per
-change, with no `File.Sync()` and no write-to-temp-then-rename, so it is
-neither efficient nor torn-write safe. A better design would be append-only
-records (one JSON line per entry, optional checksum), `Sync()` before
-acknowledging, and a way to truncate a conflicting suffix. Revisit when it
-bites.
-
-## 6. Reorganize the project into folders for readability -- TODO
+## 2. Reorganize the project into folders for readability
 
 **The problem.** Everything -- Raft logic, KV store, HTTP handlers, tests,
 docs, Docker files -- sits in one flat directory, which is getting hard to
 scan.
 
 **Decision to settle first.** In Go a folder is a *package*. Moving `.go`
-files into subfolders is not a pure move like item 0 was: it forces
-export decisions (lowercase `node`, `store`, `logEntry` etc. become
-inaccessible across packages unless capitalized or wrapped in a constructor),
-and `main` would have to import them. This is the `raft/` split that item 0
-deliberately deferred. Pick one before moving anything:
-- *Non-Go files only:* leave all `.go` files in the root as-is and move just
-  docs, Docker/Compose files, and sample data into folders (e.g. `docs/`,
+files into subfolders forces export decisions (lowercase `node`, `store`,
+`logEntry` etc. become inaccessible across packages unless capitalized or
+wrapped in a constructor), and `main` would have to import them. Pick one
+before moving anything:
+- *Non-Go files only:* leave all `.go` files in the root and move just docs,
+  Docker/Compose files, and sample data into folders (e.g. `docs/`,
   `deploy/`). No code changes, lowest risk.
 - *Real packages:* e.g. `raft/` (node, election, heartbeat, log, persist),
   `kv/` (store), and a thin `main.go`. Better structure, touches every
@@ -254,6 +110,12 @@ still finding the tests.
   to start if `NodeLogs` is empty or `NodeLogs[0].Term != 0`, matching the
   existing "refuse to start on a corrupt file" rule.
 
+- **The log is persisted as one JSON blob per change, with no `File.Sync()`
+  and no write-to-temp-then-rename.** Neither efficient nor torn-write safe
+  (this also applies to `currentTerm`/`votedFor`). A better design would be
+  append-only records (one JSON line per entry, optional checksum), `Sync()`
+  before acknowledging, and a way to truncate a conflicting suffix.
+
 - **Leftover debug output.** `fmt.Print` lines in
   [persist.go](persist.go) and [log.go](log.go) (`applyCommitted`) should be
   removed, and `gofmt -w log.go` run (it is currently flagged).
@@ -263,8 +125,7 @@ still finding the tests.
   ([election.go:147](election.go#L147)) -- but with zero peers `votes = 1`
   and `needed = (0+1)/2 + 1 = 1`, so it already *has* a majority and should
   win instantly. The early return prevents it from ever checking. A one-node
-  cluster is legitimate Raft. (The *commit* half of this was fixed during
-  item 3; only the election half remains.)
+  cluster is legitimate Raft.
 
 - **`startElection` blocks the election timer.** It's called synchronously
   ([election.go:134](election.go#L134)), so the timer isn't re-armed until the
@@ -293,49 +154,23 @@ still finding the tests.
 
 - **A follower's `/get` can be stale by one round.** The leader commits as
   soon as a majority *stores* an entry, but followers only *apply* it when
-  the next `AppendEntries` carries the advanced `leaderCommit`. So a read
-  from a follower immediately after a successful write may miss it. This is
-  correct Raft, not a bug in the implementation -- see the linearizable-read
-  note under "out of scope".
+  the next `AppendEntries` carries the advanced `leaderCommit`. Correct Raft,
+  not an implementation bug -- see the linearizable-read note under "out of
+  scope". Observed in practice with a 3-container Compose cluster (`PUT` to
+  the leader, immediate `GET` on a follower -> `404`, fine a few seconds
+  later). Open decision: lower the default `-heartbeat-interval` (1s,
+  [main.go:44](main.go#L44)), or pass a shorter one via each service's
+  `command:`, purely for demo ergonomics.
 
 ---
 
-## Containerization gaps (found while dockerizing)
+## Notes
 
-- **Kubernetes equivalents of the finished Compose setup are still open.**
-  Compose is done (SIGTERM shutdown, Dockerfile entrypoint, per-service
-  peer DNS, per-node state volumes -- all verified with a 3-container
-  cluster), but two pieces don't carry over to Kubernetes:
-  - *Peer addressing:* Compose service names (`node2:8081`) become
-    headless-Service/StatefulSet pod DNS names, a different shape.
-  - *Durable state:* the equivalent of the bind mounts is a StatefulSet with
-    `volumeClaimTemplates` (one PVC per pod); a Deployment gives no stable
-    per-pod storage, which would reopen the double-vote-after-crash bug.
-
-- **`ports:` mapping needs both sides set correctly, per service --
-  learned the hard way.** Docker's `"HOST:CONTAINER"` syntax has two
-  independent numbers: container-side must match that node's own `-addr`,
-  and host-side must be unique per service (all three can't publish to the
-  same host port at once). Getting either one wrong produces a different
-  failure -- container-side wrong means the peer/host traffic lands on a
-  port nothing listens on; host-side collision means `docker compose up`
-  fails outright with "port is already allocated". Not a code bug, just
-  worth remembering next time a new service is added to the compose file.
-
-- **Confirmed in practice: a follower's `/get` can lag ~1 heartbeat
-  interval after a write.** Not a new bug -- this is the existing
-  "follower `/get` can be stale by one round" gap noted above, just
-  actually observed for the first time via a real 3-container
-  `docker compose` cluster: `PUT` to the leader followed immediately by
-  `GET` on a follower returned `404 key not found`, and succeeded a few
-  seconds later. Consistent with the default `-heartbeat-interval` of `1s`
-  ([main.go:44](main.go#L44)) -- large enough to be visible to a human
-  typing `curl` commands by hand, not indicative of anything actually
-  broken. **Follow-up for next session:** decide whether to lower the
-  default heartbeat interval (or pass a shorter one via each service's
-  `command:` in Compose) so manual demos don't trip over this, purely for
-  demo ergonomics -- the underlying staleness is correct Raft and is
-  already tracked as out of scope for linearizable reads.
+- **Compose `ports:` needs both sides set correctly, per service.** Docker's
+  `"HOST:CONTAINER"` has two independent numbers: container-side must match
+  that node's own `-addr`, and host-side must be unique per service. Wrong
+  container-side means traffic lands on a port nothing listens on; a host-side
+  collision makes `docker compose up` fail with "port is already allocated".
 
 ---
 
@@ -345,5 +180,5 @@ still finding the tests.
 - **Log compaction / snapshotting** (§7).
 - **Full client protocol** (§8): request dedup via serial numbers, and the
   read-index/lease mechanism that makes reads linearizable rather than
-  possibly-stale. Note that even after #3, a `/get` served by a follower --
-  or by a leader that was just deposed -- can return stale data.
+  possibly-stale. Even now, a `/get` served by a follower -- or by a leader
+  that was just deposed -- can return stale data.

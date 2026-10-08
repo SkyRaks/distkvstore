@@ -15,10 +15,9 @@ import (
 // the next heartbeat or election.
 
 type persistedState struct {
-	CurrentTerm int    `json:"current_term"`
-	VotedFor    string `json:"voted_for"`
-	// what if we would have array with logs like oliver: 22, ryan: 19...
-	NodeLogs []logEntry `json:"node_log"`
+	CurrentTerm int        `json:"current_term"`
+	VotedFor    string     `json:"voted_for"`
+	NodeLogs    []logEntry `json:"node_log"`
 }
 
 func (n *node) statePath() string {
