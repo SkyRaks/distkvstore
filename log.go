@@ -56,6 +56,7 @@ func (n *node) logIsUpToDate(candidateLastIndex, candidateLastTerm int) bool {
 //
 // Caller holds n.mu.
 func (n *node) majorityMatchIndex() int {
+	// so here we add ourselfs but since we will filter out ourselfs i think i have to be len(n.peers) in this case
 	matches := make([]int, 0, len(n.peers)+1)
 	matches = append(matches, n.lastLogIndex()) // the leader holds its own log
 	for _, peer := range n.peers {

@@ -148,6 +148,7 @@ func (n *node) startElection(ctx context.Context, term int) {
 		return
 	}
 
+	// alright i guess results it will be len(n.peers) - 1 since we want to subtract ourselfs
 	results := make(chan requestVoteResponse, len(n.peers))
 	for _, peer := range n.peers {
 		go func(peer string) {
