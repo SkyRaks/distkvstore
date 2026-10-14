@@ -5,6 +5,7 @@ metadata:
   labels:
     app: raft
 spec:
+  serviceName: raft
   replicas: 3
   selector:
     matchLabels:
@@ -19,3 +20,11 @@ spec:
         image: raft-node:v1
         ports:
         - containerPort: 8080
+      volumes:
+      - name: pod-info
+        downwardAPI:
+          items:
+          # i don't understand this syntax
+            - path: "id"
+              fieldRef:
+                fieldPath: metadata.name

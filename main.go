@@ -24,18 +24,23 @@ func writeJSON(w http.ResponseWriter, v any) {
 // parsePeers turns "a:1, b:2" into []string{"a:1", "b:2"}, tolerating blanks.
 func parsePeers(s string) []string {
 	// i think we gonna filter ourselfs here
-	// -peers localhost:8081,localhost:8082
+	// raft-0.raft:8080,raft-1.raft:8080,raft-2.raft:8080
+	hostname, err := os.Hostname()
+
+	if err != nil {
+		log.Println("cannot get hostname: ", err)
+	}
 
 	peers := make([]string, 0)
 	for _, p := range strings.Split(s, ",") {
 		if p = strings.TrimSpace(p); p != "" {
-			// parts := strings.Split(p, ":")
-			// port := parts[1]
-			// if port != id {
-			// 	// and only here we will append
-			// 	peers = append(peers, p)
-			// }
-			peers = append(peers, p)
+			parts := strings.Split(p, ":")
+			before, _, _ := strings.Cut(parts[0], ".")
+
+			if before != hostname {
+				peers = append(peers, p)
+			}
+			// peers = append(peers, p)
 		}
 	}
 	return peers

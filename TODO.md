@@ -10,33 +10,26 @@ restarts, including a majority restarting at once.
 
 ## 1. Kubernetes deployment
 
-Review of the project for blockers. Nothing stops the code from running on
-Kubernetes, but item 1a must be settled first or the majority math is
-silently wrong.
+The code no longer blocks running on Kubernetes: `parsePeers` ([main.go](main.go))
+filters self out of `-peers` at startup by comparing the first DNS label of each
+entry with `os.Hostname()` (equal to the pod name in a StatefulSet), so both
+majority calculations stay correct. What remains is the manifests (1a) and
+verifying the filter inside a real pod.
 
-### 1a. Self in `-peers` breaks majorities -- MUST FIX FIRST
+### 1a. Manifest checklist (no code changes)
 
-A StatefulSet has one pod template, so every pod gets the same flags, and the
-natural `-peers` value lists all three FQDNs, including the node itself.
-Compose avoids this because each service has its own `command:` listing only
-the *other* nodes. The code assumes `peers` excludes self:
-- `needed := (len(n.peers)+1)/2 + 1` ([election.go:162](election.go#L162))
-  computes a 4-node cluster and needs 3 votes.
-- `majorityMatchIndex` ([log.go](log.go)) uses `len(n.peers)+1` the same way.
-- The node sends `RequestVote`/`AppendEntries` to itself over HTTP.
+Current state of `k8s/`: a first-draft `statefulset.yaml` and `service.yaml`
+exist but neither is applyable yet. Known gaps:
+- `service.yaml`: missing `kind: Service`; `ports` must be a list of objects
+  (`port: 8080`), not the bare number.
+- `statefulset.yaml`: the `downwardAPI` volume is never mounted and the program
+  reads flags, not files -- replace it with an `env` entry (see `-id` below).
+  No `-peers` is passed yet, so `-id` required => pods crash on start.
 
-Nothing crashes; it is the same silent split-brain as the "no agreement on
-cluster configuration" bug below. Options:
-- *Filter self out of `peers` at startup* (recommended): the pod name is the
-  DNS prefix (`raft-0.raft...`), so a peer whose host starts with `-id` is
-  self. Do it once, before `node` is built, so both majority calculations stay
-  correct.
-- *Per-pod args from a shell entrypoint* (debian-slim has `sh`): works, hacky.
-- *Three separate StatefulSets/Deployments*: Compose's shape, but gives up
-  what StatefulSets are for.
-
-### 1b. Manifest checklist (no code changes)
-
+- **Verify the self-filter in a pod.** After `kubectl apply -f k8s/`, the
+  `listening on ..., peers=[...]` log line of each pod should list exactly two
+  peers. The filter relies on the pod hostname equalling the pod name and on
+  `-peers` entries being `raft-N.<svc>...` (first label = pod name).
 - **`-id`:** env `POD_NAME` from the downward API (`metadata.name`), then
   `args: ["-id", "$(POD_NAME)"]`. Pod name as id also makes `leader_id` in the
   409 response usable as a DNS prefix.
@@ -60,7 +53,7 @@ cluster configuration" bug below. Options:
   (`kind load docker-image` / `minikube image load`) and set `imagePullPolicy`.
 - **Replicas:** fixed at 3. Membership is static, so no scaling and no HPA.
 
-### 1c. Known sharp edges on Kubernetes (not blockers)
+### 1b. Known sharp edges on Kubernetes (not blockers)
 
 - **Writes through a ClusterIP Service mostly fail.** It load-balances, so
   about 2 in 3 `PUT`s hit a follower and get 409 with `leader_id`. Retry using
