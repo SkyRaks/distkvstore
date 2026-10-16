@@ -20,11 +20,9 @@ spec:
         image: raft-node:v1
         ports:
         - containerPort: 8080
-      volumes:
-      - name: pod-info
-        downwardAPI:
-          items:
-          # i don't understand this syntax
-            - path: "id"
+        env:
+          - name: POD_NAME
+            valueFrom:
               fieldRef:
                 fieldPath: metadata.name
+        args: ["-id", "$(POD_NAME)", "-peers", "raft-0.raft:8080,raft-1.raft:8080,raft-2.raft:8080"]

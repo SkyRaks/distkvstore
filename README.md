@@ -72,6 +72,101 @@ curl -s -w '\n%{http_code}\n' "localhost:8082/put?key=y&value=2"
 # 503
 ```
 
+## Running on Kubernetes
+
+Assumes a running cluster. These commands use a local [kind](https://kind.sigs.k8s.io/)
+cluster named `raft`; adjust `--name` (or drop step 2 entirely if your cluster
+pulls from a registry).
+
+```bash
+# 1. Build the image. Run this from the repo ROOT -- the Dockerfile and the Go
+#    sources are here, not in k8s/, and `COPY . .` needs the sources.
+docker build -t raft-node:v1 .
+
+# 2. Make the image visible to the cluster. A kind node is itself a container
+#    and cannot see your local Docker images, so copy it in.
+kind load docker-image raft-node:v1 --name raft
+
+# 3. Apply both manifests: a headless Service, then a 3-replica StatefulSet.
+kubectl apply -f k8s/
+
+# 4. Three pods, named raft-0 / raft-1 / raft-2.
+kubectl get pods
+```
+
+Confirm the cluster actually formed — this is the part worth reading closely:
+
+```bash
+kubectl logs raft-0
+# [raft-0] listening on :8080, peers=[raft-1.raft:8080 raft-2.raft:8080]
+# [raft-0] granted vote to raft-2 for term 1
+# [raft-0] recognized raft-2 as leader for term 1
+```
+
+Two things to check in that output: each pod lists exactly **two** peers (not
+three — see "How identity works" below), and all three agree on one
+`leader_id` for the same term.
+
+### Talking to it
+
+Pod IPs (`10.244.0.x`) aren't routable from the host, and a headless Service
+has no cluster IP by design, so there is no address to `curl` directly. Forward
+a local port to one pod instead — it blocks, so use its own terminal:
+
+```bash
+kubectl port-forward raft-2 8080:8080     # pick whichever pod won the election
+```
+
+Then, from another terminal, every command under [Using it](#using-it) works
+unchanged against `localhost:8080`. Forward a follower on a second local port
+(`kubectl port-forward raft-0 8081:8080`) to watch replication across pods.
+
+To test from *inside* the cluster instead — pod DNS resolution, pod-to-pod
+reachability — attach a throwaway container that shares a pod's network. The
+app image is `debian-trixie-slim` and deliberately ships no `curl`, so
+`kubectl exec` won't do:
+
+```bash
+kubectl debug -it raft-0 --image=curlimages/curl --target=raft-node
+# then, inside: curl raft-1.raft:8080/ping
+```
+
+### How identity works
+
+Three mechanisms combine to let one pod template run three distinct nodes:
+
+- **Stable names.** A StatefulSet names its pods `<name>-<ordinal>`, so pod
+  `raft-1` keeps that name across restarts. A Deployment would hand out random,
+  changing names — useless as a Raft node id.
+- **`-id` per pod.** The downward API exposes the pod's own `metadata.name` as
+  the env var `POD_NAME`, which `args` interpolates as `$(POD_NAME)`. Kubernetes
+  does that substitution itself; no shell is involved.
+- **Peer DNS.** The headless Service (`clusterIP: None`) gives each pod the DNS
+  name `raft-N.raft:8080`, and every pod receives the *same* full peer list.
+  `parsePeers` ([main.go](main.go)) then drops the entry matching the pod's own
+  hostname. That filter is load-bearing: majority size is derived from
+  `len(peers)+1`, so a node left in its own peer list would compute a 4-node
+  majority and need 3 votes instead of 2.
+
+### Rebuild loop
+
+After changing Go code, the running pods keep the old image, so:
+
+```bash
+docker build -t raft-node:v1 .
+kind load docker-image raft-node:v1 --name raft
+kubectl delete pod raft-0 raft-1 raft-2   # the StatefulSet recreates them
+```
+
+Teardown is `kubectl delete -f k8s/`.
+
+> **Not production-ready, and not even demo-safe yet.** `-state-dir` still
+> defaults to `data` inside the container's ephemeral filesystem, so a deleted
+> pod loses its term, vote *and* log. Until `volumeClaimTemplates` is added
+> (TODO.md item 1a), a failover test shows the leader refilling an empty log
+> rather than a node genuinely recovering. Liveness/readiness probes,
+> `imagePullPolicy` and `podManagementPolicy: Parallel` are also still missing.
+
 ## HTTP API
 
 | Route | Methods | Parameters | Returns |
@@ -256,6 +351,9 @@ distkvstore/
 ├── ping.go            /ping, /ping-peer -- manual peer-reachability check
 ├── persist.go         currentTerm/votedFor durability across restarts
 ├── *_test.go          37 unit tests alongside the code they test
+├── Dockerfile         two-stage build: compile with Go, ship a static binary
+├── docker-compose.yml 3-node cluster in containers, one service per node
+├── k8s/               headless Service + 3-replica StatefulSet
 ├── data/              runtime state per node (gitignored, created on first run)
 ├── docs/plans/        implementation plans written before larger increments
 └── TODO.md            the full gap-analysis roadmap and known bugs

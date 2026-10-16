@@ -4,60 +4,84 @@ Open work only; finished items are removed once done (git history has them).
 
 Current state: leader election, log replication, and log persistence all work.
 A `/put` is answered `OK` only once a majority holds it, and the log survives
-restarts, including a majority restarting at once.
+restarts, including a majority restarting at once. A 3-pod StatefulSet elects a
+leader on a local kind cluster; pod state is still ephemeral and there is no
+settled way to reach the pods from the host (see 1a, 1b).
 
 ---
 
 ## 1. Kubernetes deployment
 
-The code no longer blocks running on Kubernetes: `parsePeers` ([main.go](main.go))
-filters self out of `-peers` at startup by comparing the first DNS label of each
-entry with `os.Hostname()` (equal to the pod name in a StatefulSet), so both
-majority calculations stay correct. What remains is the manifests (1a) and
-verifying the filter inside a real pod.
+**Working as of 2026-10-15.** A 3-pod StatefulSet runs on a local kind cluster
+(`kind-raft`, node container `raft-control-plane`), elects a leader, and each
+pod's `peers=[...]` log line lists exactly the two others -- so the `parsePeers`
+self-filter (first DNS label vs `os.Hostname()`, [main.go](main.go)) works in a
+real pod. `-id` comes from the downward API (`POD_NAME` <- `metadata.name`) and
+is substituted into `args` as `$(POD_NAME)`; the headless Service `raft` gives
+each pod the DNS name `raft-N.raft:8080`.
 
-### 1a. Manifest checklist (no code changes)
+Rebuild loop: `docker build -t raft-node:v1 .` from the repo root (not `k8s/`),
+then `kind load docker-image raft-node:v1 --name raft`, then delete the pods so
+they restart on the new image.
 
-Current state of `k8s/`: a first-draft `statefulset.yaml` and `service.yaml`
-exist but neither is applyable yet. Known gaps:
-- `service.yaml`: missing `kind: Service`; `ports` must be a list of objects
-  (`port: 8080`), not the bare number.
-- `statefulset.yaml`: the `downwardAPI` volume is never mounted and the program
-  reads flags, not files -- replace it with an `env` entry (see `-id` below).
-  No `-peers` is passed yet, so `-id` required => pods crash on start.
+### 1a. Remaining manifest work
 
-- **Verify the self-filter in a pod.** After `kubectl apply -f k8s/`, the
-  `listening on ..., peers=[...]` log line of each pod should list exactly two
-  peers. The filter relies on the pod hostname equalling the pod name and on
-  `-peers` entries being `raft-N.<svc>...` (first label = pod name).
-- **`-id`:** env `POD_NAME` from the downward API (`metadata.name`), then
-  `args: ["-id", "$(POD_NAME)"]`. Pod name as id also makes `leader_id` in the
-  409 response usable as a DNS prefix.
-- **`-state-dir`:** defaults to `data`, relative to `/` -- ephemeral. Point it
-  at the PVC mount path. Mandatory (reopens the double-vote-after-crash bug
-  otherwise).
-- **Storage:** StatefulSet with `volumeClaimTemplates`, one PVC per pod. Not a
-  Deployment.
-- **Peers:** `raft-N.<headless-svc>.<ns>.svc.cluster.local:8080`. All pods can
-  share one port, so the 8080/8081/8082 scheme is not needed.
-- **Headless Service:** `clusterIP: None`, plus `publishNotReadyAddresses:
-  true`.
-- **Startup:** `podManagementPolicy: Parallel`; the default `OrderedReady`
-  waits for pod-0 Ready before creating pod-1, which suits a consensus group
-  badly. Failed peer lookups just count as "vote not granted", so startup
-  races are harmless.
-- **Probes:** no `/healthz`, but `/ping` always returns 200 -- use it for
-  liveness and readiness. Do not gate readiness on having a leader. Do not
-  pass `-slow`.
-- **Image:** push to a registry, or load into kind/minikube
-  (`kind load docker-image` / `minikube image load`) and set `imagePullPolicy`.
-- **Replicas:** fixed at 3. Membership is static, so no scaling and no HPA.
+- **`-state-dir` + storage -- the big one.** `-state-dir` defaults to `data`
+  inside the container's ephemeral filesystem, so a deleted pod loses
+  `currentTerm`/`votedFor` *and* the replicated log. That reopens the
+  double-vote-after-crash bug, and makes the failover test unsound. Needs
+  `volumeClaimTemplates` (one PVC per pod -- this is what StatefulSets are for)
+  plus a `volumeMounts` entry, and `-state-dir` pointed at the mount path.
+- **`imagePullPolicy: IfNotPresent`.** Not set. A `:v1` tag means Kubernetes may
+  try to pull from a registry even though the image was side-loaded by `kind
+  load`. Works by luck right now.
+- **Probes.** No `/healthz`, but `/ping` always returns 200 -- use it for
+  liveness and readiness. Do not gate readiness on having a leader (a cluster
+  mid-election would take all pods out of the Service). Do not pass `-slow`.
+- **`podManagementPolicy: Parallel`.** The default `OrderedReady` waits for
+  pod-0 Ready before creating pod-1, which suits a consensus group badly.
+  Failed peer lookups just count as "vote not granted", so startup races are
+  harmless.
+- **`publishNotReadyAddresses: true`** on the headless Service, so peers can
+  resolve each other before they pass readiness.
+- **Replicas:** fixed at 3. Membership is static, so no scaling and no HPA
+  (`kubectl scale` is still useful to *simulate* losing a majority).
 
-### 1b. Known sharp edges on Kubernetes (not blockers)
+### 1b. Talking to the pods from outside -- decide an approach
 
-- **Writes through a ClusterIP Service mostly fail.** It load-balances, so
-  about 2 in 3 `PUT`s hit a follower and get 409 with `leader_id`. Retry using
-  `leader_id` as the pod DNS name, or `kubectl port-forward` to the leader.
+Pod IPs (`10.244.0.x`) are not routable from Windows, and the headless Service
+has no cluster IP by design, so there is no address to curl. Separately, the
+app image (`debian-trixie-slim`) ships no `curl`/`wget`/shell tools -- verified
+-- so `kubectl exec ... curl` does not work either.
+
+Do **not** fix this by adding curl to the app image: it would only let pods
+curl each other, not help from the host, and it bloats the thing being
+deployed. Debug tooling belongs in a separate throwaway container.
+
+Options, roughly in order of setup cost:
+- *`kubectl port-forward raft-N 8080:8080`* (works today, no changes): blocking,
+  one terminal per pod, but it is the normal dev workflow. Point it at the
+  leader for `/put`.
+- *Ephemeral debug container* for testing from **inside** the cluster -- pod DNS
+  resolution, pod-to-pod reachability:
+  `kubectl debug -it raft-0 --image=curlimages/curl --target=raft-node`
+  (shares the pod's network namespace). Or a standalone
+  `kubectl run curl --rm -it --image=curlimages/curl -- sh`.
+- *NodePort Service per pod* (most realistic, most setup): Kubernetes auto-labels
+  each pod `statefulset.kubernetes.io/pod-name=raft-N`, so a Service selecting
+  that label targets exactly one pod -> a stable external port per node, and
+  the leader can be addressed directly. **Catch:** on kind, NodePorts only reach
+  the Windows host if the cluster was created with `extraPortMappings` in a kind
+  config file. No such file exists, so this means deleting and recreating the
+  cluster (cheap -- all state is ephemeral anyway, see 1a).
+- *Ingress / LoadBalancer*: the production answer, overkill here, and
+  load-balancing is actively wrong for a write path that must reach the leader.
+
+### 1c. Known sharp edges on Kubernetes (not blockers)
+
+- **Writes through a load-balancing Service mostly fail.** About 2 in 3 `PUT`s
+  hit a follower and get 409 with `leader_id`. Retry using `leader_id` as the
+  pod DNS name, or address the leader directly (see 1b).
 - **Follower `/get` lags ~1 heartbeat** (same staleness seen in Compose).
 - **Torn state-file write -> CrashLoopBackOff.** `savePersistedState` is a
   plain `WriteFile` (no fsync, no atomic rename) and a parse failure is
@@ -67,6 +91,14 @@ exist but neither is applyable yet. Known gaps:
   the `.exe` to the builder. Slows the build only; the final stage copies just
   the binary. The image runs as root, which sidesteps PVC permission issues
   for now.
+- **`Dockerfile` leftovers from the tutorial it came from.** The build output is
+  named `/docker-gs-ping` before being copied to `/raft-node`, and `COPY go.mod
+  ./` + `go mod download` is a no-op with zero dependencies. Harmless, but
+  confusing to read.
+- **Manual scenarios not yet run on Kubernetes.** Failover
+  (`kubectl delete pod <leader>`) and the no-majority 503
+  (`kubectl scale statefulset raft --replicas=1`) have only been checked under
+  Compose. Both need 1a's persistence work first to mean anything.
 
 ## 2. Reorganize the project into folders for readability
 
