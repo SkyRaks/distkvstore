@@ -5,8 +5,9 @@ Open work only; finished items are removed once done (git history has them).
 Current state: leader election, log replication, and log persistence all work.
 A `/put` is answered `OK` only once a majority holds it, and the log survives
 restarts, including a majority restarting at once. A 3-pod StatefulSet elects a
-leader on a local kind cluster; pod state is still ephemeral and there is no
-settled way to reach the pods from the host (see 1a, 1b).
+leader on a local kind cluster, with one PVC per pod so `currentTerm`/`votedFor`
+and the log now survive a pod being deleted and recreated; there is still no
+settled way to reach the pods from the host (see 1b).
 
 ---
 
@@ -26,12 +27,6 @@ they restart on the new image.
 
 ### 1a. Remaining manifest work
 
-- **`-state-dir` + storage -- the big one.** `-state-dir` defaults to `data`
-  inside the container's ephemeral filesystem, so a deleted pod loses
-  `currentTerm`/`votedFor` *and* the replicated log. That reopens the
-  double-vote-after-crash bug, and makes the failover test unsound. Needs
-  `volumeClaimTemplates` (one PVC per pod -- this is what StatefulSets are for)
-  plus a `volumeMounts` entry, and `-state-dir` pointed at the mount path.
 - **`imagePullPolicy: IfNotPresent`.** Not set. A `:v1` tag means Kubernetes may
   try to pull from a registry even though the image was side-loaded by `kind
   load`. Works by luck right now.
@@ -98,7 +93,8 @@ Options, roughly in order of setup cost:
 - **Manual scenarios not yet run on Kubernetes.** Failover
   (`kubectl delete pod <leader>`) and the no-majority 503
   (`kubectl scale statefulset raft --replicas=1`) have only been checked under
-  Compose. Both need 1a's persistence work first to mean anything.
+  Compose. Now that pod state survives a restart, these are worth running for
+  real on the cluster.
 
 ## 2. Reorganize the project into folders for readability
 

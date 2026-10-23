@@ -75,6 +75,7 @@ func (n *node) loadPersistedState() {
 	}
 	n.currentTerm = s.CurrentTerm
 	n.votedFor = s.VotedFor
+	// so before we apply n.log i think we need to check first item if it is sentinel if yes we apply if not error
 	n.log = s.NodeLogs
 	log.Printf("[%s] loaded persisted state: term=%d voted_for=%q", n.id, n.currentTerm, n.votedFor)
 }

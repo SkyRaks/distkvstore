@@ -18,11 +18,27 @@ spec:
       containers:
       - name: raft-node
         image: raft-node:v1
+
+        volumeMounts:
+        - name: raft-data
+          mountPath: /data
+
         ports:
         - containerPort: 8080
         env:
-          - name: POD_NAME
-            valueFrom:
-              fieldRef:
-                fieldPath: metadata.name
-        args: ["-id", "$(POD_NAME)", "-peers", "raft-0.raft:8080,raft-1.raft:8080,raft-2.raft:8080"]
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        args: ["-id", "$(POD_NAME)", "-peers", "raft-0.raft:8080,raft-1.raft:8080,raft-2.raft:8080", "-state-dir", "/data"]
+        #  -state-dir=<that path>
+      
+  volumeClaimTemplates:
+  - metadata:
+      name: raft-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: "standard"
+      resources:
+        requests:
+          storage: 1Gi
